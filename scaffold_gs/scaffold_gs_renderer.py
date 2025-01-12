@@ -17,6 +17,27 @@ from diff_scaffold_rasterization import (
 )
 from einops import repeat
 
+from nerfstudio.utils.misc import torch_compile
+
+
+@torch_compile()
+def get_viewmat(optimized_camera_to_world):
+    """
+    function that converts c2w to gsplat world2camera matrix, using compile for some speed
+    """
+    R = optimized_camera_to_world[:, :3, :3]  # 3 x 3
+    T = optimized_camera_to_world[:, :3, 3:4]  # 3 x 1
+    # flip the z and y axes to align with gsplat conventions
+    R = R * torch.tensor([[[1, -1, -1]]], device=R.device, dtype=R.dtype)
+    # analytic matrix inverse to get world2camera matrix
+    R_inv = R.transpose(1, 2)
+    T_inv = -torch.bmm(R_inv, T)
+    viewmat = torch.zeros(R.shape[0], 4, 4, device=R.device, dtype=R.dtype)
+    viewmat[:, 3, 3] = 1.0  # homogenous
+    viewmat[:, :3, :3] = R_inv
+    viewmat[:, :3, 3:4] = T_inv
+    return viewmat
+
 
 def getProjectionMatrix(fovX, fovY, znear=0.01, zfar=100):
     tanHalfFovY = math.tan((fovY / 2))
@@ -47,12 +68,14 @@ def generate_neural_gaussians(camera, model, visible_mask=None):
             model.anchor.shape[0], dtype=torch.bool, device=model.anchor.device
         )
     ## get view properties for anchor
+    world_view_transform = get_viewmat(camera.camera_to_worlds)[0].T
+    camera_center = world_view_transform.inverse()[3, :3]
+
     feat = model.anchor_feat[visible_mask]
     anchor = model.anchor[visible_mask]
     grid_offsets = model.offset[visible_mask]
     grid_scaling = model.scaling[visible_mask]
 
-    camera_center = camera.camera_to_worlds[0, :3, 3].T
     ob_view = anchor - camera_center
     # dist
     ob_dist = ob_view.norm(dim=1, keepdim=True)
@@ -194,8 +217,15 @@ def scaffold_gs_render(
     tanfovx = math.tan(viewpoint_camera.fx * 0.5)
     tanfovy = math.tan(viewpoint_camera.fy * 0.5)
 
-    full_proj_transform = getProjectionMatrix(viewpoint_camera.fx, viewpoint_camera.fy)
-    camera_center = viewpoint_camera.camera_to_worlds[0, :3, 3].T
+    world_view_transform = get_viewmat(
+        pc.camera_optimizer.apply_to_camera(viewpoint_camera)
+    )[0].T
+    projection_matrix = getProjectionMatrix(viewpoint_camera.fx, viewpoint_camera.fy)
+    full_proj_transform = (
+        world_view_transform.unsqueeze(0).bmm(projection_matrix.unsqueeze(0))
+    ).squeeze(0)
+    camera_center = world_view_transform.inverse()[3, :3]
+
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.height),
         image_width=int(viewpoint_camera.width),
@@ -203,7 +233,7 @@ def scaffold_gs_render(
         tanfovy=tanfovy,
         bg=bg_color,
         scale_modifier=scaling_modifier,
-        viewmatrix=pc.camera_optimizer.apply_to_camera(viewpoint_camera),
+        viewmatrix=world_view_transform,
         projmatrix=full_proj_transform,
         sh_degree=1,
         campos=camera_center,
@@ -265,8 +295,14 @@ def prefilter_voxel(
     tanfovx = math.tan(viewpoint_camera.fx * 0.5)
     tanfovy = math.tan(viewpoint_camera.fy * 0.5)
 
-    full_proj_transform = getProjectionMatrix(viewpoint_camera.fx, viewpoint_camera.fy)
-    camera_center = viewpoint_camera.camera_to_worlds[0, :3, 3].T
+    world_view_transform = get_viewmat(
+        pc.camera_optimizer.apply_to_camera(viewpoint_camera)
+    )[0].T
+    projection_matrix = getProjectionMatrix(viewpoint_camera.fx, viewpoint_camera.fy)
+    full_proj_transform = (
+        world_view_transform.unsqueeze(0).bmm(projection_matrix.unsqueeze(0))
+    ).squeeze(0)
+    camera_center = world_view_transform.inverse()[3, :3]
 
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.height),
@@ -275,7 +311,7 @@ def prefilter_voxel(
         tanfovy=tanfovy,
         bg=bg_color,
         scale_modifier=scaling_modifier,
-        viewmatrix=pc.camera_optimizer.apply_to_camera(viewpoint_camera),
+        viewmatrix=world_view_transform,
         projmatrix=full_proj_transform,
         sh_degree=1,
         campos=camera_center,
