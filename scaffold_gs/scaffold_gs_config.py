@@ -1,9 +1,3 @@
-"""
-Nerfstudio Template Config
-
-Define your custom method here that registers with Nerfstudio CLI.
-"""
-
 from __future__ import annotations
 
 from scaffold_gs.scaffold_gs_model import ScaffoldGSModelConfig
@@ -37,12 +31,8 @@ scaffold_gs = MethodSpecification(
         ),
         optimizers={
             "anchor": {
-                "optimizer": AdamOptimizerConfig(lr=0.01, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_pre_warmup=0.01,
-                    lr_final=0.0001,
-                    max_steps=30000,
-                ),
+                "optimizer": AdamOptimizerConfig(lr=0, eps=1e-15),
+                "scheduler": None,
             },
             "offset": {
                 "optimizer": AdamOptimizerConfig(lr=0.01, eps=1e-15),

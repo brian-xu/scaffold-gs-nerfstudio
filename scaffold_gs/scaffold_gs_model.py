@@ -5,7 +5,6 @@ from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 
 import torch
 from einops import rearrange
-from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from pytorch_msssim import SSIM
 from scaffold_gs.scaffold_gs_renderer import prefilter_voxel, scaffold_gs_render
 from torch.nn import Parameter
@@ -21,18 +20,11 @@ from nerfstudio.engine.callbacks import (
 from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.field_components.embedding import Embedding
 from nerfstudio.field_components.mlp import MLP
-from nerfstudio.model_components.lib_bilagrid import (
-    BilateralGrid,
-    color_correct,
-    slice,
-    total_variation_loss,
-)
+from nerfstudio.model_components.lib_bilagrid import color_correct
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils.colors import get_color
-from nerfstudio.utils.math import k_nearest_sklearn, random_quat_tensor
+from nerfstudio.utils.math import k_nearest_sklearn
 from nerfstudio.utils.misc import torch_compile
-from nerfstudio.utils.rich_utils import CONSOLE
-from nerfstudio.utils.spherical_harmonics import RGB2SH, SH2RGB, num_sh_bases
 
 
 def resize_image(image: torch.Tensor, d: int):
@@ -392,6 +384,7 @@ class ScaffoldGSModel(Model):
 
     def step_post_backward(self, step):
         assert step == self.step
+        # TODO: implement anchor adjustment
         # if (
         #     step < self.config.update_until
         #     and step > self.config.update_from

@@ -1,20 +1,35 @@
-# nerfstudio-method-template
-Template repository for creating and registering methods in Nerfstudio.
+# Scaffold-GS: Structured 3D Gaussians for View-Adaptive Rendering
+Unofficial implementation of [Scaffold-GS](https://github.com/city-super/Scaffold-GS) as a [nerfstudio](https://github.com/nerfstudio-project/nerfstudio) extension.
 
-## File Structure
-We recommend the following file structure:
+![](teaser.png)
+
+(hopefully a placeholder)
+
+## Status
+
+- [ ] Functionality
+  - [x] Correctly rendering and training
+  - [ ] Anchor adjustment
+  - [ ] ...
+- [ ] Visualization
+  - [ ] Fix viser functionality
+  - [ ] ...
+- [ ] Extras
+  - [ ] Mesh export
+  - [ ] ...
+
+
+## Environment
+
+This repository has been tested on the following environment. Other similar configurations should also work.
 
 ```
-├── my_method
-│   ├── __init__.py
-│   ├── my_config.py
-│   ├── custom_pipeline.py [optional]
-│   ├── custom_model.py [optional]
-│   ├── custom_field.py [optional]
-│   ├── custom_datamanger.py [optional]
-│   ├── custom_dataparser.py [optional]
-│   ├── ...
-├── pyproject.toml
+pop-os 22.04
+cuda 11.8
+gcc 10.5
+python 3.10.16
+torch 2.1.2+cu118
+torchvision 0.16.2+cu118
 ```
 
 ## Registering with Nerfstudio
@@ -22,13 +37,31 @@ Ensure that nerfstudio has been installed according to the [instructions](https:
 
 ```
 conda activate nerfstudio
-cd nerfstudio-method-template/
+cd scaffold-gs-nerfstudio/
 pip install -e .
 ns-install-cli
 ```
 
-## Running the new method
-This repository creates a new Nerfstudio method named "method-template". To train with it, run the command:
+## Running Scaffold-GS
+This repository creates a new Nerfstudio method named "scaffold-gs". To train with it, run the command:
 ```
-ns-train method-template --data [PATH]
+ns-train scaffold-gs --data [PATH]
 ```
+
+## Acknowledgements
+
+Thanks to the authors of [Scaffold-GS](https://github.com/city-super/Scaffold-GS) for the reference implementation, which we build upon heavily.
+
+### Scaffold-GS: Structured 3D Gaussians for View-Adaptive Rendering
+
+```bibtex
+@inproceedings{scaffoldgs,
+  title={Scaffold-gs: Structured 3d gaussians for view-adaptive rendering},
+  author={Lu, Tao and Yu, Mulin and Xu, Linning and Xiangli, Yuanbo and Wang, Limin and Lin, Dahua and Dai, Bo},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages={20654--20664},
+  year={2024}
+}
+```
+
+Thanks to the authors of [Splatfacto-360](https://github.com/myuito3/splatfacto-360) for their code converting nerfstudio cameras to the COLMAP format.
