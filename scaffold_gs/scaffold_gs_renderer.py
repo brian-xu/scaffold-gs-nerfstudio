@@ -16,67 +16,24 @@ from diff_scaffold_rasterization import (
     GaussianRasterizer,
 )
 from einops import repeat
-
-from nerfstudio.utils.misc import torch_compile
-
-
-@torch_compile()
-def get_viewmat(optimized_camera_to_world):
-    """
-    function that converts c2w to gsplat world2camera matrix, using compile for some speed
-    """
-    R = optimized_camera_to_world[:, :3, :3]  # 3 x 3
-    T = optimized_camera_to_world[:, :3, 3:4]  # 3 x 1
-    # flip the z and y axes to align with gsplat conventions
-    R = R * torch.tensor([[[1, -1, -1]]], device=R.device, dtype=R.dtype)
-    # analytic matrix inverse to get world2camera matrix
-    R_inv = R.transpose(1, 2)
-    T_inv = -torch.bmm(R_inv, T)
-    viewmat = torch.zeros(R.shape[0], 4, 4, device=R.device, dtype=R.dtype)
-    viewmat[:, 3, 3] = 1.0  # homogenous
-    viewmat[:, :3, :3] = R_inv
-    viewmat[:, :3, 3:4] = T_inv
-    return viewmat
+from scaffold_gs.gaussian_splatting.cameras import convert_to_colmap_camera
 
 
-def getProjectionMatrix(fovX, fovY, znear=0.01, zfar=100):
-    tanHalfFovY = math.tan((fovY / 2))
-    tanHalfFovX = math.tan((fovX / 2))
-
-    top = tanHalfFovY * znear
-    bottom = -top
-    right = tanHalfFovX * znear
-    left = -right
-
-    P = torch.zeros(4, 4, device="cuda")
-
-    z_sign = 1.0
-
-    P[0, 0] = 2.0 * znear / (right - left)
-    P[1, 1] = 2.0 * znear / (top - bottom)
-    P[0, 2] = (right + left) / (right - left)
-    P[1, 2] = (top + bottom) / (top - bottom)
-    P[3, 2] = z_sign
-    P[2, 2] = z_sign * zfar / (zfar - znear)
-    P[2, 3] = -(zfar * znear) / (zfar - znear)
-    return P
-
-
-def generate_neural_gaussians(camera, model, visible_mask=None):
+def generate_neural_gaussians(viewpoint_camera, model, visible_mask=None):
     if visible_mask is None:
         visible_mask = torch.ones(
             model.anchor.shape[0], dtype=torch.bool, device=model.anchor.device
         )
+
+    colmap_camera = convert_to_colmap_camera(viewpoint_camera)
     ## get view properties for anchor
-    world_view_transform = get_viewmat(camera.camera_to_worlds)[0].T
-    camera_center = world_view_transform.inverse()[3, :3]
 
     feat = model.anchor_feat[visible_mask]
     anchor = model.anchor[visible_mask]
     grid_offsets = model.offset[visible_mask]
     grid_scaling = model.scaling[visible_mask]
 
-    ob_view = anchor - camera_center
+    ob_view = anchor - colmap_camera.camera_center
     # dist
     ob_dist = ob_view.norm(dim=1, keepdim=True)
     # view
@@ -101,14 +58,14 @@ def generate_neural_gaussians(camera, model, visible_mask=None):
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1)  # [N, c+3]
     if (
         model.config.appearance_dim > 0
-        and camera.metadata is not None
-        and "cam_idx" in camera.metadata
+        and viewpoint_camera.metadata is not None
+        and "cam_idx" in viewpoint_camera.metadata
     ):
         camera_indicies = (
             torch.ones_like(
                 cat_local_view[:, 0], dtype=torch.long, device=ob_dist.device
             )
-            * camera.metadata["cam_idx"]
+            * viewpoint_camera.metadata["cam_idx"]
         )
         # camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * 10
         appearance = model.appearance(camera_indicies)
@@ -130,8 +87,8 @@ def generate_neural_gaussians(camera, model, visible_mask=None):
     # get offset's color
     if (
         model.config.appearance_dim > 0
-        and camera.metadata is not None
-        and "cam_idx" in camera.metadata
+        and viewpoint_camera.metadata is not None
+        and "cam_idx" in viewpoint_camera.metadata
     ):
         if model.config.add_color_dist:
             color = model.color_mlp(torch.cat([cat_local_view, appearance], dim=1))
@@ -175,13 +132,13 @@ def generate_neural_gaussians(camera, model, visible_mask=None):
     scaling = scaling_repeat[:, 3:] * torch.sigmoid(
         scale_rot[:, :3]
     )  # * (1+torch.sigmoid(repeat_dist))
-    quats = scale_rot[:, 3:7]
+    rots = torch.nn.functional.normalize(scale_rot[:, 3:7])
 
     # post-process offsets to get centers for gaussians
     offsets = offsets * scaling_repeat[:, :3]
     xyz = repeat_anchor + offsets
 
-    return xyz, color, opacity, scaling, quats, neural_opacity, mask
+    return xyz, color, opacity, scaling, rots, neural_opacity, mask
 
 
 def scaffold_gs_render(
@@ -213,30 +170,23 @@ def scaffold_gs_render(
         except:
             pass
 
-    # Set up rasterization configuration
-    tanfovx = math.tan(viewpoint_camera.fx * 0.5)
-    tanfovy = math.tan(viewpoint_camera.fy * 0.5)
+    colmap_camera = convert_to_colmap_camera(viewpoint_camera)
 
-    world_view_transform = get_viewmat(
-        pc.camera_optimizer.apply_to_camera(viewpoint_camera)
-    )[0].T
-    projection_matrix = getProjectionMatrix(viewpoint_camera.fx, viewpoint_camera.fy)
-    full_proj_transform = (
-        world_view_transform.unsqueeze(0).bmm(projection_matrix.unsqueeze(0))
-    ).squeeze(0)
-    camera_center = world_view_transform.inverse()[3, :3]
+    # Set up rasterization configuration
+    tanfovx = math.tan(colmap_camera.FoVx * 0.5)
+    tanfovy = math.tan(colmap_camera.FoVy * 0.5)
 
     raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.height),
-        image_width=int(viewpoint_camera.width),
+        image_height=int(colmap_camera.image_height),
+        image_width=int(colmap_camera.image_width),
         tanfovx=tanfovx,
         tanfovy=tanfovy,
         bg=bg_color,
         scale_modifier=scaling_modifier,
-        viewmatrix=world_view_transform,
-        projmatrix=full_proj_transform,
+        viewmatrix=colmap_camera.world_view_transform,
+        projmatrix=colmap_camera.full_proj_transform,
         sh_degree=1,
-        campos=camera_center,
+        campos=colmap_camera.camera_center,
         prefiltered=False,
         debug=False,
     )
@@ -291,30 +241,23 @@ def prefilter_voxel(
     except:
         pass
 
-    # Set up rasterization configuration
-    tanfovx = math.tan(viewpoint_camera.fx * 0.5)
-    tanfovy = math.tan(viewpoint_camera.fy * 0.5)
+    colmap_camera = convert_to_colmap_camera(viewpoint_camera)
 
-    world_view_transform = get_viewmat(
-        pc.camera_optimizer.apply_to_camera(viewpoint_camera)
-    )[0].T
-    projection_matrix = getProjectionMatrix(viewpoint_camera.fx, viewpoint_camera.fy)
-    full_proj_transform = (
-        world_view_transform.unsqueeze(0).bmm(projection_matrix.unsqueeze(0))
-    ).squeeze(0)
-    camera_center = world_view_transform.inverse()[3, :3]
+    # Set up rasterization configuration
+    tanfovx = math.tan(colmap_camera.FoVx * 0.5)
+    tanfovy = math.tan(colmap_camera.FoVy * 0.5)
 
     raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.height),
-        image_width=int(viewpoint_camera.width),
+        image_height=int(colmap_camera.image_height),
+        image_width=int(colmap_camera.image_width),
         tanfovx=tanfovx,
         tanfovy=tanfovy,
         bg=bg_color,
         scale_modifier=scaling_modifier,
-        viewmatrix=world_view_transform,
-        projmatrix=full_proj_transform,
+        viewmatrix=colmap_camera.world_view_transform,
+        projmatrix=colmap_camera.full_proj_transform,
         sh_degree=1,
-        campos=camera_center,
+        campos=colmap_camera.camera_center,
         prefiltered=False,
         debug=False,
     )
