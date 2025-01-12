@@ -22,55 +22,120 @@ from nerfstudio.plugins.types import MethodSpecification
 scaffold_gs = MethodSpecification(
     config=TrainerConfig(
         method_name="scaffold-gs",
-        steps_per_eval_batch=500,
+        steps_per_eval_image=100,
+        steps_per_eval_batch=0,
         steps_per_save=2000,
+        steps_per_eval_all_images=1000,
         max_num_iterations=30000,
-        mixed_precision=True,
+        mixed_precision=False,
         pipeline=VanillaPipelineConfig(
             datamanager=FullImageDatamanagerConfig(
                 dataparser=NerfstudioDataParserConfig(load_3D_points=True),
                 cache_images_type="uint8",
             ),
-            model=ScaffoldGSModelConfig(),
+            model=ScaffoldGSModelConfig(appearance_dim=0),
         ),
         optimizers={
-            "means": {
-                "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
+            "anchor": {
+                "optimizer": AdamOptimizerConfig(lr=0.01, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_final=1.6e-6,
+                    lr_pre_warmup=0.01,
+                    lr_final=0.0001,
                     max_steps=30000,
                 ),
             },
-            "features_dc": {
-                "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
+            "offset": {
+                "optimizer": AdamOptimizerConfig(lr=0.01, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(
+                    lr_pre_warmup=0.01,
+                    lr_final=0.0001,
+                    max_steps=30000,
+                ),
+            },
+            "anchor_feat": {
+                "optimizer": AdamOptimizerConfig(lr=0.0075, eps=1e-15),
                 "scheduler": None,
             },
-            "features_rest": {
-                "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
+            "opacity": {
+                "optimizer": AdamOptimizerConfig(lr=0.02, eps=1e-15),
                 "scheduler": None,
             },
-            "opacities": {
+            "scaling": {
+                "optimizer": AdamOptimizerConfig(lr=0.007, eps=1e-15),
+                "scheduler": None,
+            },
+            "rotation": {
+                "optimizer": AdamOptimizerConfig(lr=0.002, eps=1e-15),
+                "scheduler": None,
+            },
+            "mlp_opacity": {
+                "optimizer": AdamOptimizerConfig(lr=0.002, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(
+                    lr_pre_warmup=0.002,
+                    lr_final=0.00002,
+                    max_steps=30000,
+                ),
+            },
+            "mlp_opacity": {
+                "optimizer": AdamOptimizerConfig(lr=0.002, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(
+                    lr_pre_warmup=0.002,
+                    lr_final=0.00002,
+                    max_steps=30000,
+                ),
+            },
+            "mlp_cov": {
+                "optimizer": AdamOptimizerConfig(lr=0.004, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(
+                    lr_pre_warmup=0.004,
+                    lr_final=0.004,
+                    max_steps=30000,
+                ),
+            },
+            "mlp_cov": {
+                "optimizer": AdamOptimizerConfig(lr=0.004, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(
+                    lr_pre_warmup=0.004,
+                    lr_final=0.004,
+                    max_steps=30000,
+                ),
+            },
+            "mlp_color": {
+                "optimizer": AdamOptimizerConfig(lr=0.008, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(
+                    lr_pre_warmup=0.008,
+                    lr_final=0.00005,
+                    max_steps=30000,
+                ),
+            },
+            "mlp_color": {
+                "optimizer": AdamOptimizerConfig(lr=0.008, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(
+                    lr_pre_warmup=0.008,
+                    lr_final=0.00005,
+                    max_steps=30000,
+                ),
+            },
+            "mlp_feature_bank": {
+                "optimizer": AdamOptimizerConfig(lr=0.01, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(
+                    lr_pre_warmup=0.01,
+                    lr_final=0.00001,
+                    max_steps=30000,
+                ),
+            },
+            "embedding_appearance": {
                 "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
-                "scheduler": None,
-            },
-            "scales": {
-                "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
-                "scheduler": None,
-            },
-            "quats": {
-                "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
-                "scheduler": None,
+                "scheduler": ExponentialDecaySchedulerConfig(
+                    lr_pre_warmup=0.05,
+                    lr_final=0.0005,
+                    max_steps=30000,
+                ),
             },
             "camera_opt": {
                 "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(
                     lr_final=5e-7, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
-                ),
-            },
-            "bilateral_grid": {
-                "optimizer": AdamOptimizerConfig(lr=2e-3, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_final=1e-4, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
                 ),
             },
         },

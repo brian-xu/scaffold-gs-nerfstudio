@@ -2,12 +2,13 @@
 name = "scaffold-gs-nerfstudio"
 description = "Scaffold-GS extension for nerfstudio."
 version = "0.0.0"
+dependencies = [
+  "einops",
+  "nerfstudio >= 1.1.5"
+]
 
-dependencies = ["nerfstudio >= 1.1.5"] 
+[project.entry-points."nerfstudio.method_configs"]
+scaffold-gs = "scaffold_gs.scaffold_gs_config:scaffold_gs"
 
 [tool.setuptools.packages.find]
-include = ["scaffold_gs*"]
-
-# register the entry point of your new method here:
-[project.entry-points.'nerfstudio.method_configs']
-scaffold-gs = 'scaffold_gs.scaffold_gs_config:scaffold-gs'
+include = [ "scaffold_gs*" ]

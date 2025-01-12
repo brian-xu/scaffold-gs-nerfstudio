@@ -4,13 +4,10 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 
 import torch
+from einops import rearrange
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from pytorch_msssim import SSIM
-from scaffold_gs.scaffold_gs_renderer import (
-    generate_neural_gaussians,
-    prefilter_voxel,
-    render,
-)
+from scaffold_gs.scaffold_gs_renderer import prefilter_voxel, scaffold_gs_render
 from torch.nn import Parameter
 
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
@@ -22,6 +19,8 @@ from nerfstudio.engine.callbacks import (
     TrainingCallbackLocation,
 )
 from nerfstudio.engine.optimizers import Optimizers
+from nerfstudio.field_components.embedding import Embedding
+from nerfstudio.field_components.mlp import MLP
 from nerfstudio.model_components.lib_bilagrid import (
     BilateralGrid,
     color_correct,
@@ -79,10 +78,30 @@ def get_viewmat(optimized_camera_to_world):
 
 @dataclass
 class ScaffoldGSModelConfig(ModelConfig):
-    """ScaffoldGS Model Config, nerfstudio's implementation of Gaussian Splatting"""
+    """Scaffold-GS Model Config"""
 
     _target: Type = field(default_factory=lambda: ScaffoldGSModel)
+    feat_dim: int = 32
+    n_offsets: int = 5
+    voxel_size: float = 0.01
+    update_depth: int = 3
+    update_init_factor: int = 100
+    update_hierachy_factor: int = 4
+    use_feat_bank: bool = False
+    appearance_dim: int = 32
+    ratio: int = 1
+    add_opacity_dist: bool = False
+    add_cov_dist: bool = False
+    add_color_dist: bool = False
+    # for anchor densification
+    update_from: int = 1500
+    update_interval: int = 100
+    update_until: int = 15_000
     warmup_length: int = 500
+    # densification config
+    min_opacity = 0.005
+    success_threshold = 0.8
+    densify_grad_threshold = 0.0002
     """period of steps where refinement is turned off"""
     refine_every: int = 100
     """period of steps where gaussians are culled and densified"""
@@ -167,10 +186,10 @@ class ScaffoldGSModelConfig(ModelConfig):
 
 
 class ScaffoldGSModel(Model):
-    """Nerfstudio's implementation of Gaussian Splatting
+    """Nerfstudio implementation of Scaffold-GS
 
     Args:
-        config: ScaffoldGS configuration to instantiate model
+        config: Scaffold-GS configuration to instantiate model
     """
 
     config: ScaffoldGSModelConfig
@@ -185,49 +204,89 @@ class ScaffoldGSModel(Model):
         super().__init__(*args, **kwargs)
 
     def populate_modules(self):
+
+        def inverse_sigmoid(x):
+            return torch.log(x / (1 - x))
+
         if self.seed_points is not None and not self.config.random_init:
-            means = torch.nn.Parameter(self.seed_points[0])  # (Location, Color)
+            anchor = torch.nn.Parameter(self.seed_points[0])
         else:
-            means = torch.nn.Parameter(
+            anchor = torch.nn.Parameter(
                 (torch.rand((self.config.num_random, 3)) - 0.5)
                 * self.config.random_scale
             )
-        distances, _ = k_nearest_sklearn(means.data, 3)
+        offset = torch.zeros((anchor.shape[0], self.config.n_offsets, 3)).float().cuda()
+        anchor_feat = (
+            torch.zeros((anchor.shape[0], self.config.feat_dim)).float().cuda()
+        )
+        distances, _ = k_nearest_sklearn(anchor.data, 3)
         # find the average of the three nearest neighbors for each point and use that as the scale
         avg_dist = distances.mean(dim=-1, keepdim=True)
-        scales = torch.nn.Parameter(torch.log(avg_dist.repeat(1, 3)))
-        num_points = means.shape[0]
-        quats = torch.nn.Parameter(random_quat_tensor(num_points))
-        dim_sh = num_sh_bases(self.config.sh_degree)
+        scaling = torch.nn.Parameter(torch.log(avg_dist.repeat(1, 6)))
+        rotation = torch.zeros((anchor.shape[0], 4), device="cuda")
+        rotation[:, 0] = 1
+        opacity = inverse_sigmoid(
+            0.1 * torch.ones((anchor.shape[0], 1), dtype=torch.float, device="cuda")
+        )
 
-        if (
-            self.seed_points is not None
-            and not self.config.random_init
-            # We can have colors without points.
-            and self.seed_points[1].shape[0] > 0
-        ):
-            shs = torch.zeros((self.seed_points[1].shape[0], dim_sh, 3)).float().cuda()
-            if self.config.sh_degree > 0:
-                shs[:, 0, :3] = RGB2SH(self.seed_points[1] / 255)
-                shs[:, 1:, 3:] = 0.0
-            else:
-                CONSOLE.log("use color only optimization with sigmoid activation")
-                shs[:, 0, :3] = torch.logit(self.seed_points[1] / 255, eps=1e-10)
-            features_dc = torch.nn.Parameter(shs[:, 0, :])
-            features_rest = torch.nn.Parameter(shs[:, 1:, :])
-        else:
-            features_dc = torch.nn.Parameter(torch.rand(num_points, 3))
-            features_rest = torch.nn.Parameter(torch.zeros((num_points, dim_sh - 1, 3)))
+        opacity_dist_dim = 1 if self.config.add_opacity_dist else 0
+        self.mlp_opacity = torch.nn.Sequential(
+            MLP(self.config.feat_dim + 3 + opacity_dist_dim, 1, self.config.feat_dim),
+            torch.nn.ReLU(True),
+            MLP(self.config.feat_dim, 1, self.config.n_offsets),
+            torch.nn.Tanh(),
+        )
+        self.mlp_opacity.train()
+        cov_dist_dim = 1 if self.config.add_cov_dist else 0
+        self.mlp_cov = torch.nn.Sequential(
+            MLP(self.config.feat_dim + 3 + cov_dist_dim, 1, self.config.feat_dim),
+            torch.nn.ReLU(True),
+            MLP(self.config.feat_dim, 1, 7 * self.config.n_offsets),
+        )
+        self.mlp_cov.train()
+        color_dist_dim = 1 if self.config.add_color_dist else 0
+        self.mlp_color = torch.nn.Sequential(
+            MLP(
+                self.config.feat_dim + 3 + color_dist_dim + self.config.appearance_dim,
+                1,
+                self.config.feat_dim,
+            ),
+            torch.nn.ReLU(True),
+            MLP(self.config.feat_dim, 1, 3 * self.config.n_offsets),
+            torch.nn.Sigmoid(),
+        )
+        self.mlp_color.train()
+        self.mlp_feature_bank = torch.nn.Sequential(
+            MLP(3 + 1, 1, self.config.feat_dim),
+            torch.nn.ReLU(True),
+            MLP(self.config.feat_dim, 1, 3),
+            torch.nn.Softmax(dim=1),
+        )
+        self.mlp_feature_bank.train()
+        self.embedding_appearance = Embedding(
+            self.num_train_data, self.config.appearance_dim
+        )
+        self.embedding_appearance.train()
 
-        opacities = torch.nn.Parameter(torch.logit(0.1 * torch.ones(num_points, 1)))
+        self.opacity_accum = torch.empty(0)
+        self.max_radii2D = torch.empty(0)
+
+        self.offset_gradient_accum = torch.empty(0)
+        self.offset_denom = torch.empty(0)
+
+        self.anchor_demon = torch.empty(0)
+
+        self.percent_dense = 0
+        self.spatial_lr_scale = 0
+
         self.gauss_params = torch.nn.ParameterDict(
             {
-                "means": means,
-                "scales": scales,
-                "quats": quats,
-                "features_dc": features_dc,
-                "features_rest": features_rest,
-                "opacities": opacities,
+                "anchor": anchor,
+                "offset": offset,
+                "anchor_feat": anchor_feat,
+                "scaling": scaling,
+                "rotation": rotation,
+                "opacity": opacity,
             }
         )
 
@@ -251,111 +310,68 @@ class ScaffoldGSModel(Model):
             )  # This color is the same as the default background color in Viser. This would only affect the background color when rendering.
         else:
             self.background_color = get_color(self.config.background_color)
-        if self.config.use_bilateral_grid:
-            self.bil_grids = BilateralGrid(
-                num=self.num_train_data,
-                grid_X=self.config.grid_shape[0],
-                grid_Y=self.config.grid_shape[1],
-                grid_W=self.config.grid_shape[2],
-            )
-
-        # Strategy for GS densification
-        if self.config.strategy == "default":
-            # Strategy for GS densification
-            self.strategy = DefaultStrategy(
-                prune_opa=self.config.cull_alpha_thresh,
-                grow_grad2d=self.config.densify_grad_thresh,
-                grow_scale3d=self.config.densify_size_thresh,
-                grow_scale2d=self.config.split_screen_size,
-                prune_scale3d=self.config.cull_scale_thresh,
-                prune_scale2d=self.config.cull_screen_size,
-                refine_scale2d_stop_iter=self.config.stop_screen_size_at,
-                refine_start_iter=self.config.warmup_length,
-                refine_stop_iter=self.config.stop_split_at,
-                reset_every=self.config.reset_alpha_every * self.config.refine_every,
-                refine_every=self.config.refine_every,
-                pause_refine_after_reset=self.num_train_data + self.config.refine_every,
-                absgrad=self.config.use_absgrad,
-                revised_opacity=False,
-                verbose=True,
-            )
-            self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
-        elif self.config.strategy == "mcmc":
-            self.strategy = MCMCStrategy(
-                cap_max=self.config.max_gs_num,
-                noise_lr=self.config.noise_lr,
-                refine_start_iter=self.config.warmup_length,
-                refine_stop_iter=self.config.stop_split_at,
-                refine_every=self.config.refine_every,
-                min_opacity=self.config.cull_alpha_thresh,
-                verbose=False,
-            )
-            self.strategy_state = self.strategy.initialize_state()
-        else:
-            raise ValueError(
-                f"""ScaffoldGS does not support strategy {self.config.strategy} 
-                             Currently, the supported strategies include default and mcmc."""
-            )
-
-    @property
-    def colors(self):
-        if self.config.sh_degree > 0:
-            return SH2RGB(self.features_dc)
-        else:
-            return torch.sigmoid(self.features_dc)
-
-    @property
-    def shs_0(self):
-        if self.config.sh_degree > 0:
-            return self.features_dc
-        else:
-            return RGB2SH(torch.sigmoid(self.features_dc))
-
-    @property
-    def shs_rest(self):
-        return self.features_rest
 
     @property
     def num_points(self):
-        return self.means.shape[0]
+        return self.anchor.shape[0]
 
     @property
-    def means(self):
-        return self.gauss_params["means"]
+    def appearance(self):
+        return self.embedding_appearance
 
     @property
-    def scales(self):
-        return self.gauss_params["scales"]
+    def scaling(self):
+        return 1.0 * torch.exp(self.gauss_params["scaling"])
 
     @property
-    def quats(self):
-        return self.gauss_params["quats"]
+    def featurebank_mlp(self):
+        return self.mlp_feature_bank
 
     @property
-    def features_dc(self):
-        return self.gauss_params["features_dc"]
+    def opacity_mlp(self):
+        return self.mlp_opacity
 
     @property
-    def features_rest(self):
-        return self.gauss_params["features_rest"]
+    def cov_mlp(self):
+        return self.mlp_cov
 
     @property
-    def opacities(self):
-        return self.gauss_params["opacities"]
+    def color_mlp(self):
+        return self.mlp_color
+
+    @property
+    def rotation(self):
+        return self.gauss_params["rotation"]
+
+    @property
+    def anchor(self):
+        return self.gauss_params["anchor"]
+
+    @property
+    def offset(self):
+        return self.gauss_params["offset"]
+
+    @property
+    def anchor_feat(self):
+        return self.gauss_params["anchor_feat"]
+
+    @property
+    def opacity(self):
+        return self.gauss_params["opacity"]
 
     def load_state_dict(self, dict, **kwargs):  # type: ignore
         # resize the parameters to match the new number of points
         self.step = 30000
-        if "means" in dict:
+        if "anchor" in dict:
             # For backwards compatibility, we remap the names of parameters from
             # means->gauss_params.means since old checkpoints have that format
             for p in [
-                "means",
-                "scales",
-                "quats",
-                "features_dc",
-                "features_rest",
-                "opacities",
+                "anchor",
+                "offset",
+                "anchor_feat",
+                "scaling",
+                "rotation",
+                "opacity",
             ]:
                 dict[f"gauss_params.{p}"] = dict[p]
         newp = dict["gauss_params.means"].shape[0]
@@ -376,28 +392,17 @@ class ScaffoldGSModel(Model):
 
     def step_post_backward(self, step):
         assert step == self.step
-        if isinstance(self.strategy, DefaultStrategy):
-            self.strategy.step_post_backward(
-                params=self.gauss_params,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=self.step,
-                info=self.info,
-                packed=False,
-            )
-        elif isinstance(self.strategy, MCMCStrategy):
-            self.strategy.step_post_backward(
-                params=self.gauss_params,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=step,
-                info=self.info,
-                lr=self.schedulers["means"].get_last_lr()[
-                    0
-                ],  # the learning rate for the "means" attribute of the GS
-            )
-        else:
-            raise ValueError(f"Unknown strategy {self.strategy}")
+        # if (
+        #     step < self.config.update_until
+        #     and step > self.config.update_from
+        #     and step % self.config.update_interval == 0
+        # ):
+        #     self.adjust_anchor(
+        #         check_interval=self.config.update_interval,
+        #         success_threshold=self.config.success_threshold,
+        #         grad_threshold=self.config.densify_grad_threshold,
+        #         min_opacity=self.config.min_opacity,
+        #     )
 
     def get_training_callbacks(
         self, training_callback_attributes: TrainingCallbackAttributes
@@ -429,12 +434,12 @@ class ScaffoldGSModel(Model):
         return {
             name: [self.gauss_params[name]]
             for name in [
-                "means",
-                "scales",
-                "quats",
-                "features_dc",
-                "features_rest",
-                "opacities",
+                "anchor",
+                "offset",
+                "anchor_feat",
+                "scaling",
+                "rotation",
+                "opacity",
             ]
         }
 
@@ -445,9 +450,12 @@ class ScaffoldGSModel(Model):
             Mapping of different parameter groups
         """
         gps = self.get_gaussian_param_groups()
-        if self.config.use_bilateral_grid:
-            gps["bilateral_grid"] = list(self.bil_grids.parameters())
         self.camera_optimizer.get_param_groups(param_groups=gps)
+        gps["mlp_opacity"] = list(self.opacity_mlp.parameters())
+        gps["mlp_feature_bank"] = list(self.featurebank_mlp.parameters())
+        gps["mlp_cov"] = list(self.mlp_cov.parameters())
+        gps["mlp_color"] = list(self.mlp_color.parameters())
+        gps["embedding_appearance"] = list(self.appearance.parameters())
         return gps
 
     def _get_downscale_factor(self):
@@ -496,25 +504,6 @@ class ScaffoldGSModel(Model):
             raise ValueError(f"Unknown background color {self.config.background_color}")
         return background
 
-    def _apply_bilateral_grid(
-        self, rgb: torch.Tensor, cam_idx: int, H: int, W: int
-    ) -> torch.Tensor:
-        # make xy grid
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(0, 1.0, H, device=self.device),
-            torch.linspace(0, 1.0, W, device=self.device),
-            indexing="ij",
-        )
-        grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
-
-        out = slice(
-            bil_grids=self.bil_grids,
-            rgb=rgb,
-            xy=grid_xy,
-            grid_idx=torch.tensor(cam_idx, device=self.device, dtype=torch.long),
-        )
-        return out["rgb"]
-
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         """Takes in a camera and returns a dictionary of outputs.
 
@@ -529,119 +518,46 @@ class ScaffoldGSModel(Model):
             print("Called get_outputs with not a camera")
             return {}
 
-        if self.training:
-            assert camera.shape[0] == 1, "Only one camera at a time"
-            optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)
-        else:
-            optimized_camera_to_world = camera.camera_to_worlds
-
-        # cropping
-        if self.crop_box is not None and not self.training:
-            crop_ids = self.crop_box.within(self.means).squeeze()
-            if crop_ids.sum() == 0:
-                return self.get_empty_outputs(
-                    int(camera.width.item()),
-                    int(camera.height.item()),
-                    self.background_color,
-                )
-        else:
-            crop_ids = None
-
-        if crop_ids is not None:
-            opacities_crop = self.opacities[crop_ids]
-            means_crop = self.means[crop_ids]
-            features_dc_crop = self.features_dc[crop_ids]
-            features_rest_crop = self.features_rest[crop_ids]
-            scales_crop = self.scales[crop_ids]
-            quats_crop = self.quats[crop_ids]
-        else:
-            opacities_crop = self.opacities
-            means_crop = self.means
-            features_dc_crop = self.features_dc
-            features_rest_crop = self.features_rest
-            scales_crop = self.scales
-            quats_crop = self.quats
-
-        colors_crop = torch.cat(
-            (features_dc_crop[:, None, :], features_rest_crop), dim=1
-        )
-
+        assert camera.shape[0] == 1, "Only one camera at a time"
         camera_scale_fac = self._get_downscale_factor()
         camera.rescale_output_resolution(1 / camera_scale_fac)
-        viewmat = get_viewmat(optimized_camera_to_world)
-        K = camera.get_intrinsics_matrices().cuda()
         W, H = int(camera.width.item()), int(camera.height.item())
         self.last_size = (H, W)
-        camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
-
-        # apply the compensation of screen space blurring to gaussians
-        if self.config.rasterize_mode not in ["antialiased", "classic"]:
-            raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
-
-        if self.config.output_depth_during_training or not self.training:
-            render_mode = "RGB+ED"
-        else:
-            render_mode = "RGB"
-
-        if self.config.sh_degree > 0:
-            sh_degree_to_use = min(
-                self.step // self.config.sh_degree_interval, self.config.sh_degree
-            )
-        else:
-            colors_crop = torch.sigmoid(colors_crop).squeeze(1)  # [N, 1, 3] -> [N, 3]
-            sh_degree_to_use = None
-
-        render, alpha, self.info = rasterization(
-            means=means_crop,
-            quats=quats_crop,  # rasterization does normalization internally
-            scales=torch.exp(scales_crop),
-            opacities=torch.sigmoid(opacities_crop).squeeze(-1),
-            colors=colors_crop,
-            viewmats=viewmat,  # [1, 4, 4]
-            Ks=K,  # [1, 3, 3]
-            width=W,
-            height=H,
-            packed=False,
-            near_plane=0.01,
-            far_plane=1e10,
-            render_mode=render_mode,
-            sh_degree=sh_degree_to_use,
-            sparse_grad=False,
-            absgrad=(
-                self.strategy.absgrad
-                if isinstance(self.strategy, DefaultStrategy)
-                else False
-            ),
-            rasterize_mode=self.config.rasterize_mode,
-            # set some threshold to disregrad small gaussians for faster rendering.
-            # radius_clip=3.0,
-        )
-        if self.training:
-            self.strategy.step_pre_backward(
-                self.gauss_params,
-                self.optimizers,
-                self.strategy_state,
-                self.step,
-                self.info,
-            )
-        alpha = alpha[:, ...]
 
         background = self._get_background_color()
-        rgb = render[:, ..., :3] + (1 - alpha) * background
+        voxel_visible_mask = prefilter_voxel(camera, self, background)
+        render_pkg = scaffold_gs_render(
+            camera,
+            self,
+            background,
+            visible_mask=voxel_visible_mask,
+            retain_grad=True,
+        )
+
+        camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
+
+        (
+            render,
+            viewspace_point_tensor,
+            visibility_filter,
+            offset_selection_mask,
+            radii,
+            scaling,
+            alpha,
+        ) = (
+            render_pkg["render"],
+            render_pkg["viewspace_points"],
+            render_pkg["visibility_filter"],
+            render_pkg["selection_mask"],
+            render_pkg["radii"],
+            render_pkg["scaling"],
+            render_pkg["neural_opacity"],
+        )
+        alpha = alpha[:, ...]
+
+        rgb = rearrange(render, "c h w -> h w c")
         rgb = torch.clamp(rgb, 0.0, 1.0)
-
-        # apply bilateral grid
-        if self.config.use_bilateral_grid and self.training:
-            if camera.metadata is not None and "cam_idx" in camera.metadata:
-                rgb = self._apply_bilateral_grid(rgb, camera.metadata["cam_idx"], H, W)
-
-        if render_mode == "RGB+ED":
-            depth_im = render[:, ..., 3:4]
-            depth_im = torch.where(
-                alpha > 0, depth_im, depth_im.detach().max()
-            ).squeeze(0)
-        else:
-            depth_im = None
+        depth_im = None
 
         if background.shape[0] == 3 and not self.training:
             background = background.expand(H, W, 3)
@@ -729,45 +645,15 @@ class ScaffoldGSModel(Model):
         simloss = 1 - self.ssim(
             gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...]
         )
-        if self.config.use_scale_regularization and self.step % 10 == 0:
-            scale_exp = torch.exp(self.scales)
-            scale_reg = (
-                torch.maximum(
-                    scale_exp.amax(dim=-1) / scale_exp.amin(dim=-1),
-                    torch.tensor(self.config.max_gauss_ratio),
-                )
-                - self.config.max_gauss_ratio
-            )
-            scale_reg = 0.1 * scale_reg.mean()
-        else:
-            scale_reg = torch.tensor(0.0).to(self.device)
 
         loss_dict = {
             "main_loss": (1 - self.config.ssim_lambda) * Ll1
             + self.config.ssim_lambda * simloss,
-            "scale_reg": scale_reg,
         }
-
-        # Losses for mcmc
-        if self.config.strategy == "mcmc":
-            if self.config.mcmc_opacity_reg > 0.0:
-                mcmc_opacity_reg = (
-                    self.config.mcmc_opacity_reg
-                    * torch.abs(torch.sigmoid(self.gauss_params["opacities"])).mean()
-                )
-                loss_dict["mcmc_opacity_reg"] = mcmc_opacity_reg
-            if self.config.mcmc_scale_reg > 0.0:
-                mcmc_scale_reg = (
-                    self.config.mcmc_scale_reg
-                    * torch.abs(torch.exp(self.gauss_params["scales"])).mean()
-                )
-                loss_dict["mcmc_scale_reg"] = mcmc_scale_reg
 
         if self.training:
             # Add loss from camera optimizer
             self.camera_optimizer.get_loss_dict(loss_dict)
-            if self.config.use_bilateral_grid:
-                loss_dict["tv_loss"] = 10 * total_variation_loss(self.bil_grids.grids)
 
         return loss_dict
 
