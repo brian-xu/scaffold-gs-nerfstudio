@@ -19,19 +19,19 @@ from einops import repeat
 from scaffold_gs.gaussian_splatting.cameras import convert_to_colmap_camera
 
 
-def generate_neural_gaussians(viewpoint_camera, model, visible_mask=None):
+def generate_neural_gaussians(viewpoint_camera, pc, visible_mask=None):
     if visible_mask is None:
         visible_mask = torch.ones(
-            model.anchor.shape[0], dtype=torch.bool, device=model.anchor.device
+            pc.anchor.shape[0], dtype=torch.bool, device=pc.anchor.device
         )
 
     colmap_camera = convert_to_colmap_camera(viewpoint_camera)
     ## get view properties for anchor
 
-    feat = model.anchor_feat[visible_mask]
-    anchor = model.anchor[visible_mask]
-    grid_offsets = model.offset[visible_mask]
-    grid_scaling = model.scaling[visible_mask]
+    feat = pc.anchor_feat[visible_mask]
+    anchor = pc.anchor[visible_mask]
+    grid_offsets = pc.offset[visible_mask]
+    grid_scaling = pc.scaling[visible_mask]
 
     ob_view = anchor - colmap_camera.camera_center
     # dist
@@ -40,10 +40,10 @@ def generate_neural_gaussians(viewpoint_camera, model, visible_mask=None):
     ob_view = ob_view / ob_dist
 
     ## view-adaptive feature
-    if model.config.use_feat_bank:
+    if pc.config.use_feat_bank:
         cat_view = torch.cat([ob_view, ob_dist], dim=1)
 
-        bank_weight = model.featurebank_mlp(cat_view).unsqueeze(dim=1)  # [n, 1, 3]
+        bank_weight = pc.featurebank_mlp(cat_view).unsqueeze(dim=1)  # [n, 1, 3]
 
         ## multi-resolution feat
         feat = feat.unsqueeze(dim=-1)
@@ -57,7 +57,7 @@ def generate_neural_gaussians(viewpoint_camera, model, visible_mask=None):
     cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1)  # [N, c+3+1]p
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1)  # [N, c+3]
     if (
-        model.config.appearance_dim > 0
+        pc.config.appearance_dim > 0
         and viewpoint_camera.metadata is not None
         and "cam_idx" in viewpoint_camera.metadata
     ):
@@ -68,13 +68,13 @@ def generate_neural_gaussians(viewpoint_camera, model, visible_mask=None):
             * viewpoint_camera.metadata["cam_idx"]
         )
         # camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * 10
-        appearance = model.appearance(camera_indicies)
+        appearance = pc.appearance(camera_indicies)
 
     # get offset's opacity
-    if model.config.add_opacity_dist:
-        neural_opacity = model.opacity_mlp(cat_local_view)  # [N, k]
+    if pc.config.add_opacity_dist:
+        neural_opacity = pc.opacity_mlp(cat_local_view)  # [N, k]
     else:
-        neural_opacity = model.opacity_mlp(cat_local_view_wodist)
+        neural_opacity = pc.opacity_mlp(cat_local_view_wodist)
 
     # opacity mask generation
     neural_opacity = neural_opacity.reshape([-1, 1])
@@ -86,30 +86,30 @@ def generate_neural_gaussians(viewpoint_camera, model, visible_mask=None):
 
     # get offset's color
     if (
-        model.config.appearance_dim > 0
+        pc.config.appearance_dim > 0
         and viewpoint_camera.metadata is not None
         and "cam_idx" in viewpoint_camera.metadata
     ):
-        if model.config.add_color_dist:
-            color = model.color_mlp(torch.cat([cat_local_view, appearance], dim=1))
+        if pc.config.add_color_dist:
+            color = pc.color_mlp(torch.cat([cat_local_view, appearance], dim=1))
         else:
-            color = model.color_mlp(
+            color = pc.color_mlp(
                 torch.cat([cat_local_view_wodist, appearance], dim=1)
             )
     else:
-        if model.config.add_color_dist:
-            color = model.color_mlp(cat_local_view)
+        if pc.config.add_color_dist:
+            color = pc.color_mlp(cat_local_view)
         else:
-            color = model.color_mlp(cat_local_view_wodist)
-    color = color.reshape([anchor.shape[0] * model.config.n_offsets, 3])  # [mask]
+            color = pc.color_mlp(cat_local_view_wodist)
+    color = color.reshape([anchor.shape[0] * pc.config.n_offsets, 3])  # [mask]
 
     # get offset's cov
-    if model.config.add_cov_dist:
-        scale_rot = model.cov_mlp(cat_local_view)
+    if pc.config.add_cov_dist:
+        scale_rot = pc.cov_mlp(cat_local_view)
     else:
-        scale_rot = model.cov_mlp(cat_local_view_wodist)
+        scale_rot = pc.cov_mlp(cat_local_view_wodist)
     scale_rot = scale_rot.reshape(
-        [anchor.shape[0] * model.config.n_offsets, 7]
+        [anchor.shape[0] * pc.config.n_offsets, 7]
     )  # [mask]
 
     # offsets
@@ -118,7 +118,7 @@ def generate_neural_gaussians(viewpoint_camera, model, visible_mask=None):
     # combine for parallel masking
     concatenated = torch.cat([grid_scaling, anchor], dim=-1)
     concatenated_repeated = repeat(
-        concatenated, "n (c) -> (n k) (c)", k=model.config.n_offsets
+        concatenated, "n (c) -> (n k) (c)", k=pc.config.n_offsets
     )
     concatenated_all = torch.cat(
         [concatenated_repeated, color, scale_rot, offsets], dim=-1

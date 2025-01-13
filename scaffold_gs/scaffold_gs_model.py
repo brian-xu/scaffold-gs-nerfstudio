@@ -94,8 +94,6 @@ class ScaffoldGSModelConfig(ModelConfig):
     min_opacity = 0.005
     success_threshold = 0.8
     densify_grad_threshold = 0.0002
-    """period of steps where refinement is turned off"""
-    refine_every: int = 100
     """period of steps where gaussians are culled and densified"""
     resolution_schedule: int = 3000
     """training starts at 1/d resolution, every n steps this is doubled"""
@@ -103,28 +101,8 @@ class ScaffoldGSModelConfig(ModelConfig):
     """Whether to randomize the background color."""
     num_downscales: int = 2
     """at the beginning, resolution is 1/2^d, where d is this number"""
-    cull_alpha_thresh: float = 0.1
-    """threshold of opacity for culling gaussians. One can set it to a lower value (e.g. 0.005) for higher quality."""
-    cull_scale_thresh: float = 0.5
-    """threshold of scale for culling huge gaussians"""
-    reset_alpha_every: int = 30
-    """Every this many refinement steps, reset the alpha"""
     densify_grad_thresh: float = 0.0008
     """threshold of positional gradient norm for densifying gaussians"""
-    use_absgrad: bool = True
-    """Whether to use absgrad to densify gaussians, if False, will use grad rather than absgrad"""
-    densify_size_thresh: float = 0.01
-    """below this size, gaussians are *duplicated*, otherwise split"""
-    n_split_samples: int = 2
-    """number of samples to split gaussians into"""
-    sh_degree_interval: int = 1000
-    """every n intervals turn on another sh degree"""
-    cull_screen_size: float = 0.15
-    """if a gaussian is more than this percent of screen space, cull it"""
-    split_screen_size: float = 0.05
-    """if a gaussian is more than this percent of screen space, split it"""
-    stop_screen_size_at: int = 4000
-    """stop culling/splitting at this step WRT screen size of gaussians"""
     random_init: bool = False
     """whether to initialize the positions uniformly randomly (not SFM points)"""
     num_random: int = 50000
@@ -135,46 +113,12 @@ class ScaffoldGSModelConfig(ModelConfig):
     """weight of ssim loss"""
     stop_split_at: int = 15000
     """stop splitting at this step"""
-    sh_degree: int = 3
-    """maximum degree of spherical harmonics to use"""
-    use_scale_regularization: bool = False
-    """If enabled, a scale regularization introduced in PhysGauss (https://xpandora.github.io/PhysGaussian/) is used for reducing huge spikey gaussians."""
-    max_gauss_ratio: float = 10.0
-    """threshold of ratio of gaussian max to min scale before applying regularization
-    loss from the PhysGaussian paper
-    """
-    output_depth_during_training: bool = False
-    """If True, output depth during training. Otherwise, only output depth during evaluation."""
-    rasterize_mode: Literal["classic", "antialiased"] = "classic"
-    """
-    Classic mode of rendering will use the EWA volume splatting with a [0.3, 0.3] screen space blurring kernel. This
-    approach is however not suitable to render tiny gaussians at higher or lower resolution than the captured, which
-    results "aliasing-like" artifacts. The antialiased mode overcomes this limitation by calculating compensation factors
-    and apply them to the opacities of gaussians to preserve the total integrated density of splats.
-
-    However, PLY exported with antialiased rasterize mode is not compatible with classic mode. Thus many web viewers that
-    were implemented for classic mode can not render antialiased mode PLY properly without modifications.
-    """
     camera_optimizer: CameraOptimizerConfig = field(
         default_factory=lambda: CameraOptimizerConfig(mode="off")
     )
     """Config of the camera optimizer to use"""
-    use_bilateral_grid: bool = False
-    """If True, use bilateral grid to handle the ISP changes in the image space. This technique was introduced in the paper 'Bilateral Guided Radiance Field Processing' (https://bilarfpro.github.io/)."""
-    grid_shape: Tuple[int, int, int] = (16, 16, 8)
-    """Shape of the bilateral grid (X, Y, W)"""
     color_corrected_metrics: bool = False
     """If True, apply color correction to the rendered images before computing the metrics."""
-    strategy: Literal["default", "mcmc"] = "default"
-    """The default strategy will be used if strategy is not specified. Other strategies, e.g. mcmc, can be used."""
-    max_gs_num: int = 1_000_000
-    """Maximum number of GSs. Default to 1_000_000."""
-    noise_lr: float = 5e5
-    """MCMC samping noise learning rate. Default to 5e5."""
-    mcmc_opacity_reg: float = 0.01
-    """Regularization term for opacity in MCMC strategy. Only enabled when using MCMC strategy"""
-    mcmc_scale_reg: float = 0.01
-    """Regularization term for scale in MCMC strategy. Only enabled when using MCMC strategy"""
 
 
 class ScaffoldGSModel(Model):
@@ -229,6 +173,7 @@ class ScaffoldGSModel(Model):
             torch.nn.Tanh(),
         )
         self.mlp_opacity.train()
+
         cov_dist_dim = 1 if self.config.add_cov_dist else 0
         self.mlp_cov = torch.nn.Sequential(
             MLP(self.config.feat_dim + 3 + cov_dist_dim, 1, self.config.feat_dim),
@@ -236,6 +181,7 @@ class ScaffoldGSModel(Model):
             MLP(self.config.feat_dim, 1, 7 * self.config.n_offsets),
         )
         self.mlp_cov.train()
+
         color_dist_dim = 1 if self.config.add_color_dist else 0
         self.mlp_color = torch.nn.Sequential(
             MLP(
@@ -248,6 +194,7 @@ class ScaffoldGSModel(Model):
             torch.nn.Sigmoid(),
         )
         self.mlp_color.train()
+
         self.mlp_feature_bank = torch.nn.Sequential(
             MLP(3 + 1, 1, self.config.feat_dim),
             torch.nn.ReLU(True),
@@ -255,6 +202,7 @@ class ScaffoldGSModel(Model):
             torch.nn.Softmax(dim=1),
         )
         self.mlp_feature_bank.train()
+
         self.embedding_appearance = Embedding(
             self.num_train_data, self.config.appearance_dim
         )
@@ -519,12 +467,13 @@ class ScaffoldGSModel(Model):
 
         background = self._get_background_color()
         voxel_visible_mask = prefilter_voxel(camera, self, background)
+        retain_grad = self.step < self.config.update_until and self.step >= 0
         render_pkg = scaffold_gs_render(
             camera,
             self,
             background,
             visible_mask=voxel_visible_mask,
-            retain_grad=True,
+            retain_grad=retain_grad,
         )
 
         camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
@@ -536,7 +485,7 @@ class ScaffoldGSModel(Model):
             offset_selection_mask,
             radii,
             scaling,
-            alpha,
+            opacity,
         ) = (
             render_pkg["render"],
             render_pkg["viewspace_points"],
@@ -546,19 +495,15 @@ class ScaffoldGSModel(Model):
             render_pkg["scaling"],
             render_pkg["neural_opacity"],
         )
-        alpha = alpha[:, ...]
 
         rgb = rearrange(render, "c h w -> h w c")
         rgb = torch.clamp(rgb, 0.0, 1.0)
-        depth_im = None
 
         if background.shape[0] == 3 and not self.training:
             background = background.expand(H, W, 3)
 
         return {
             "rgb": rgb.squeeze(0),  # type: ignore
-            "depth": depth_im,  # type: ignore
-            "accumulation": alpha.squeeze(0),  # type: ignore
             "background": background,  # type: ignore
         }  # type: ignore
 

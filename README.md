@@ -28,6 +28,7 @@ pop-os 22.04
 cuda 11.8
 gcc 10.5
 python 3.10.16
+numpy 1.26.4
 torch 2.1.2+cu118
 torchvision 0.16.2+cu118
 ```

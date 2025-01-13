@@ -7,6 +7,7 @@ dependencies = [
   "diff_scaffold_rasterization @ git+https://github.com/brian-xu/diff-scaffold-rasterization.git",
   "simple_knn @ git+https://gitlab.inria.fr/bkerbl/simple-knn.git",
   "nerfstudio >= 1.1.5",
+  "numpy == 1.26.4",
 ]
 
 [project.entry-points."nerfstudio.method_configs"]
