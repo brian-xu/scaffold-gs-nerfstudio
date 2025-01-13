@@ -4,11 +4,13 @@ description = "Scaffold-GS extension for nerfstudio."
 version = "0.0.0"
 dependencies = [
   "einops",
-  "nerfstudio >= 1.1.5"
+  "diff_scaffold_rasterization @ git+https://github.com/brian-xu/diff-scaffold-rasterization.git",
+  "simple_knn @ git+https://gitlab.inria.fr/bkerbl/simple-knn.git",
+  "nerfstudio >= 1.1.5",
 ]
 
 [project.entry-points."nerfstudio.method_configs"]
 scaffold-gs = "scaffold_gs.scaffold_gs_config:scaffold_gs"
 
 [tool.setuptools.packages.find]
-include = [ "scaffold_gs*" ]
+include = ["scaffold_gs*"]
