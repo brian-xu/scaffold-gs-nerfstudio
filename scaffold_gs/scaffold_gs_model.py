@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import reduce
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 
 import torch
@@ -8,6 +9,7 @@ from einops import rearrange
 from pytorch_msssim import SSIM
 from scaffold_gs.scaffold_gs_renderer import prefilter_voxel, scaffold_gs_render
 from torch.nn import Parameter
+from torch_scatter import scatter_max
 
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
@@ -48,6 +50,10 @@ def resize_image(image: torch.Tensor, d: int):
     )
 
 
+def inverse_sigmoid(x):
+    return torch.log(x / (1 - x))
+
+
 @dataclass
 class ScaffoldGSModelConfig(ModelConfig):
     """Scaffold-GS Model Config"""
@@ -66,6 +72,7 @@ class ScaffoldGSModelConfig(ModelConfig):
     add_cov_dist: bool = False
     add_color_dist: bool = False
     # for anchor densification
+    start_stat: int = 500
     update_from: int = 1500
     update_interval: int = 100
     update_until: int = 15_000
@@ -121,9 +128,6 @@ class ScaffoldGSModel(Model):
 
     def populate_modules(self):
 
-        def inverse_sigmoid(x):
-            return torch.log(x / (1 - x))
-
         if self.seed_points is not None and not self.config.random_init:
             anchor = torch.nn.Parameter(self.seed_points[0])
         else:
@@ -139,11 +143,9 @@ class ScaffoldGSModel(Model):
         # find the average of the three nearest neighbors for each point and use that as the scale
         avg_dist = distances.mean(dim=-1, keepdim=True)
         scaling = torch.nn.Parameter(torch.log(avg_dist.repeat(1, 6)))
-        rotation = torch.zeros((anchor.shape[0], 4), device="cuda")
+        rotation = torch.zeros((anchor.shape[0], 4)).cuda()
         rotation[:, 0] = 1
-        opacity = inverse_sigmoid(
-            0.1 * torch.ones((anchor.shape[0], 1), dtype=torch.float, device="cuda")
-        )
+        opacity = inverse_sigmoid(0.1 * torch.ones((anchor.shape[0], 1)).float().cuda())
 
         opacity_dist_dim = 1 if self.config.add_opacity_dist else 0
         self.mlp_opacity = torch.nn.Sequential(
@@ -188,13 +190,22 @@ class ScaffoldGSModel(Model):
         )
         self.embedding_appearance.train()
 
-        self.opacity_accum = torch.empty(0)
-        self.max_radii2D = torch.empty(0)
+        self.opacity_accum = torch.zeros((anchor.shape[0], 1)).float().cuda()
 
-        self.offset_gradient_accum = torch.empty(0)
-        self.offset_denom = torch.empty(0)
+        self.offset_gradient_accum = (
+            torch.zeros((anchor.shape[0] * self.config.n_offsets, 1)).float().cuda()
+        )
+        self.offset_denom = (
+            torch.zeros((anchor.shape[0] * self.config.n_offsets, 1)).float().cuda()
+        )
 
-        self.anchor_demon = torch.empty(0)
+        self.anchor_denom = torch.zeros((anchor.shape[0], 1)).float().cuda()
+
+        self.viewspace_point_tensor = None
+        self.neural_opacity = None
+        self.visibility_filter = None
+        self.offset_selection_mask = None
+        self.voxel_visible_mask = None
 
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -313,17 +324,19 @@ class ScaffoldGSModel(Model):
     def step_post_backward(self, step):
         assert step == self.step
         # TODO: implement anchor adjustment
-        # if (
-        #     step < self.config.update_until
-        #     and step > self.config.update_from
-        #     and step % self.config.update_interval == 0
-        # ):
-        #     self.adjust_anchor(
-        #         check_interval=self.config.update_interval,
-        #         success_threshold=self.config.success_threshold,
-        #         grad_threshold=self.config.densify_grad_threshold,
-        #         min_opacity=self.config.min_opacity,
-        #     )
+        if self.step < self.config.update_until and self.step > self.config.start_stat:
+            self.update_anchor_adjustment_stats()
+        if (
+            step < self.config.update_until
+            and step > self.config.update_from
+            and step % self.config.update_interval == 0
+        ):
+            self.adjust_anchor(
+                check_interval=self.config.update_interval,
+                success_threshold=self.config.success_threshold,
+                grad_threshold=self.config.densify_grad_threshold,
+                min_opacity=self.config.min_opacity,
+            )
 
     def get_training_callbacks(
         self, training_callback_attributes: TrainingCallbackAttributes
@@ -474,6 +487,12 @@ class ScaffoldGSModel(Model):
             render_pkg["scaling"],
             render_pkg["neural_opacity"],
         )
+
+        self.viewspace_point_tensor = viewspace_point_tensor
+        self.neural_opacity = opacity
+        self.visibility_filter = visibility_filter
+        self.offset_selection_mask = offset_selection_mask
+        self.voxel_visible_mask = voxel_visible_mask
 
         rgb = rearrange(render, "c h w -> h w c")
         rgb = torch.clamp(rgb, 0.0, 1.0)
@@ -644,3 +663,391 @@ class ScaffoldGSModel(Model):
         images_dict = {"img": combined_rgb}
 
         return metrics_dict, images_dict
+
+    def update_anchor_adjustment_stats(self):
+        # update opacity stats
+        temp_opacity = self.neural_opacity.clone().view(-1).detach().cuda()
+        temp_opacity[temp_opacity < 0] = 0
+
+        temp_opacity = temp_opacity.view([-1, self.config.n_offsets])
+        self.opacity_accum[self.voxel_visible_mask] += temp_opacity.sum(
+            dim=1, keepdim=True
+        )
+
+        # update anchor visiting stats
+        self.anchor_denom[self.voxel_visible_mask] += 1
+
+        # update neural gaussian stats
+        self.voxel_visible_mask = (
+            self.voxel_visible_mask.unsqueeze(dim=1)
+            .repeat([1, self.config.n_offsets])
+            .view(-1)
+        )
+        combined_mask = torch.zeros_like(
+            self.offset_gradient_accum, dtype=torch.bool
+        ).squeeze(dim=1)
+        combined_mask[self.voxel_visible_mask] = self.offset_selection_mask
+        temp_mask = combined_mask.clone()
+        combined_mask[temp_mask] = self.visibility_filter
+
+        grad_norm = torch.norm(
+            self.viewspace_point_tensor.grad[self.visibility_filter, :2],
+            dim=-1,
+            keepdim=True,
+        )
+        self.offset_gradient_accum[combined_mask] += grad_norm
+        self.offset_denom[combined_mask] += 1
+
+    def replace_tensor_to_optimizer(self, tensor, name):
+        optimizable_tensors = {}
+        for optim_name in self.optimizers:
+            if optim_name == name:
+                optim = self.optimizers[optim_name]
+                group = optim.param_groups[0]
+                stored_state = optim.state.get(group["params"][0], None)
+                stored_state["exp_avg"] = torch.zeros_like(tensor)
+                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+
+                del optim.state[group["params"][0]]
+                group["params"][0] = torch.nn.Parameter(tensor.requires_grad_(True))
+                optim.state[group["params"][0]] = stored_state
+
+                optimizable_tensors[optim_name] = group["params"][0]
+        return optimizable_tensors
+
+    def cat_tensors_to_optimizer(self, tensors_dict):
+        optimizable_tensors = {}
+        for optim_name in self.optimizers:
+            if (
+                "mlp" in optim_name
+                or "conv" in optim_name
+                or "feat_base" in optim_name
+                or "embedding" in optim_name
+            ):
+                continue
+            optim = self.optimizers[optim_name]
+            group = optim.param_groups[0]
+            assert len(group["params"]) == 1
+            extension_tensor = tensors_dict[optim_name]
+            stored_state = optim.state.get(group["params"][0], None)
+            if stored_state is not None:
+                stored_state["exp_avg"] = torch.cat(
+                    (stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0
+                )
+                stored_state["exp_avg_sq"] = torch.cat(
+                    (stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)),
+                    dim=0,
+                )
+
+                del optim.state[group["params"][0]]
+                group["params"][0] = torch.nn.Parameter(
+                    torch.cat(
+                        (group["params"][0], extension_tensor), dim=0
+                    ).requires_grad_(True)
+                )
+                optim.state[group["params"][0]] = stored_state
+
+            else:
+                group["params"][0] = torch.nn.Parameter(
+                    torch.cat(
+                        (group["params"][0], extension_tensor), dim=0
+                    ).requires_grad_(True)
+                )
+            optimizable_tensors[optim_name] = group["params"][0]
+
+        return optimizable_tensors
+
+    def _prune_anchor_optimizer(self, mask):
+        optimizable_tensors = {}
+        for optim_name in self.optimizers:
+            if (
+                "mlp" in optim_name
+                or "conv" in optim_name
+                or "feat_base" in optim_name
+                or "embedding" in optim_name
+            ):
+                continue
+
+            optim = self.optimizers[optim_name]
+            group = optim.param_groups[0]
+
+            stored_state = optim.state.get(group["params"][0], None)
+            if stored_state is not None:
+                stored_state["exp_avg"] = stored_state["exp_avg"][mask]
+                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+
+                del optim.state[group["params"][0]]
+
+                new_param = group["params"][0][mask]
+                if optim_name == "scaling":
+                    temp = new_param[:, 3:]
+                    temp[temp > 0.05] = 0.05
+                    new_param[:, 3:] = temp
+                group["params"][0] = torch.nn.Parameter(
+                    (new_param.requires_grad_(True))
+                )
+                optim.state[group["params"][0]] = stored_state
+            else:
+                new_param = group["params"][0][mask]
+                if optim_name == "scaling":
+                    temp = new_param[:, 3:]
+                    temp[temp > 0.05] = 0.05
+                    new_param[:, 3:] = temp
+                group["params"][0] = torch.nn.Parameter(
+                    (new_param.requires_grad_(True))
+                )
+            optimizable_tensors[optim_name] = group["params"][0]
+
+        return optimizable_tensors
+
+    def prune_anchor(self, mask):
+        valid_points_mask = ~mask
+
+        optimizable_tensors = self._prune_anchor_optimizer(valid_points_mask)
+
+        self.gauss_params["anchor"] = optimizable_tensors["anchor"]
+        self.gauss_params["offset"] = optimizable_tensors["offset"]
+        self.gauss_params["anchor_feat"] = optimizable_tensors["anchor_feat"]
+        self.gauss_params["opacity"] = optimizable_tensors["opacity"]
+        self.gauss_params["scaling"] = optimizable_tensors["scaling"]
+        self.gauss_params["rotation"] = optimizable_tensors["rotation"]
+
+    def anchor_growing(self, grads, threshold, offset_mask):
+        ##
+        init_length = self.anchor.shape[0] * self.config.n_offsets
+        for i in range(self.config.update_depth):
+            # update threshold
+            cur_threshold = threshold * ((self.config.update_hierachy_factor // 2) ** i)
+            # mask from grad threshold
+            candidate_mask = grads >= cur_threshold
+            candidate_mask = torch.logical_and(candidate_mask, offset_mask)
+
+            # random pick
+            rand_mask = torch.rand_like(candidate_mask.float()) > (0.5 ** (i + 1))
+            rand_mask = rand_mask.cuda()
+            candidate_mask = torch.logical_and(candidate_mask, rand_mask)
+
+            length_inc = self.anchor.shape[0] * self.config.n_offsets - init_length
+            if length_inc == 0:
+                if i > 0:
+                    continue
+            else:
+                candidate_mask = torch.cat(
+                    [
+                        candidate_mask,
+                        torch.zeros(length_inc).bool().cuda(),
+                    ],
+                    dim=0,
+                )
+
+            all_xyz = self.anchor.unsqueeze(dim=1) + self.offset * self.scaling[
+                :, :3
+            ].unsqueeze(dim=1)
+
+            # assert self.update_init_factor // (self.update_hierachy_factor**i) > 0
+            # size_factor = min(self.update_init_factor // (self.update_hierachy_factor**i), 1)
+            size_factor = self.config.update_init_factor // (
+                self.config.update_hierachy_factor**i
+            )
+            cur_size = self.config.voxel_size * size_factor
+
+            grid_coords = torch.round(self.anchor / cur_size).int()
+
+            selected_xyz = all_xyz.view([-1, 3])[candidate_mask]
+            selected_grid_coords = torch.round(selected_xyz / cur_size).int()
+
+            selected_grid_coords_unique, inverse_indices = torch.unique(
+                selected_grid_coords, return_inverse=True, dim=0
+            )
+
+            ## split data for reducing peak memory calling
+            use_chunk = True
+            if use_chunk:
+                chunk_size = 4096
+                max_iters = grid_coords.shape[0] // chunk_size + (
+                    1 if grid_coords.shape[0] % chunk_size != 0 else 0
+                )
+                remove_duplicates_list = []
+                for i in range(max_iters):
+                    cur_remove_duplicates = (
+                        (
+                            selected_grid_coords_unique.unsqueeze(1)
+                            == grid_coords[i * chunk_size : (i + 1) * chunk_size, :]
+                        )
+                        .all(-1)
+                        .any(-1)
+                        .view(-1)
+                    )
+                    remove_duplicates_list.append(cur_remove_duplicates)
+
+                remove_duplicates = reduce(torch.logical_or, remove_duplicates_list)
+            else:
+                remove_duplicates = (
+                    (selected_grid_coords_unique.unsqueeze(1) == grid_coords)
+                    .all(-1)
+                    .any(-1)
+                    .view(-1)
+                )
+
+            remove_duplicates = ~remove_duplicates
+            candidate_anchor = selected_grid_coords_unique[remove_duplicates] * cur_size
+
+            if candidate_anchor.shape[0] > 0:
+                new_scaling = (
+                    torch.ones_like(candidate_anchor).repeat([1, 2]).float().cuda()
+                    * cur_size
+                )  # *0.05
+                new_scaling = torch.log(new_scaling)
+                new_rotation = (
+                    torch.zeros([candidate_anchor.shape[0], 4]).float().cuda()
+                )
+                new_rotation[:, 0] = 1.0
+
+                new_opacities = inverse_sigmoid(
+                    0.1 * torch.ones((candidate_anchor.shape[0], 1)).float().cuda()
+                )
+
+                new_feat = (
+                    self.anchor_feat.unsqueeze(dim=1)
+                    .repeat([1, self.config.n_offsets, 1])
+                    .view([-1, self.config.feat_dim])[candidate_mask]
+                )
+
+                new_feat = scatter_max(
+                    new_feat,
+                    inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)),
+                    dim=0,
+                )[0][remove_duplicates]
+
+                new_offsets = (
+                    torch.zeros_like(candidate_anchor)
+                    .unsqueeze(dim=1)
+                    .repeat([1, self.config.n_offsets, 1])
+                    .float()
+                    .cuda()
+                )
+
+                d = {
+                    "anchor": candidate_anchor,
+                    "scaling": new_scaling,
+                    "rotation": new_rotation,
+                    "anchor_feat": new_feat,
+                    "offset": new_offsets,
+                    "opacity": new_opacities,
+                }
+
+                temp_anchor_denom = torch.cat(
+                    [
+                        self.anchor_denom,
+                        torch.zeros([new_opacities.shape[0], 1]).float().cuda(),
+                    ],
+                    dim=0,
+                )
+                del self.anchor_denom
+                self.anchor_denom = temp_anchor_denom
+
+                temp_opacity_accum = torch.cat(
+                    [
+                        self.opacity_accum,
+                        torch.zeros([new_opacities.shape[0], 1]).float().cuda(),
+                    ],
+                    dim=0,
+                )
+                del self.opacity_accum
+                self.opacity_accum = temp_opacity_accum
+
+                torch.cuda.empty_cache()
+
+                optimizable_tensors = self.cat_tensors_to_optimizer(d)
+                self.gauss_params["anchor"] = optimizable_tensors["anchor"]
+                self.gauss_params["offset"] = optimizable_tensors["offset"]
+                self.gauss_params["anchor_feat"] = optimizable_tensors["anchor_feat"]
+                self.gauss_params["opacity"] = optimizable_tensors["opacity"]
+                self.gauss_params["scaling"] = optimizable_tensors["scaling"]
+                self.gauss_params["rotation"] = optimizable_tensors["rotation"]
+
+    def adjust_anchor(
+        self,
+        check_interval=100,
+        success_threshold=0.8,
+        grad_threshold=0.0002,
+        min_opacity=0.005,
+    ):
+        # # adding anchors
+        grads = self.offset_gradient_accum / self.offset_denom  # [N*k, 1]
+        grads[grads.isnan()] = 0.0
+        grads_norm = torch.norm(grads, dim=-1)
+        offset_mask = (
+            self.offset_denom > check_interval * success_threshold * 0.5
+        ).squeeze(dim=1)
+
+        self.anchor_growing(grads_norm, grad_threshold, offset_mask)
+
+        # update offset_denom
+        self.offset_denom[offset_mask] = 0
+        padding_offset_demon = torch.zeros(
+            [
+                self.anchor.shape[0] * self.config.n_offsets
+                - self.offset_denom.shape[0],
+                1,
+            ],
+            dtype=torch.int32,
+            device=self.offset_denom.device,
+        )
+        self.offset_denom = torch.cat([self.offset_denom, padding_offset_demon], dim=0)
+
+        self.offset_gradient_accum[offset_mask] = 0
+        padding_offset_gradient_accum = torch.zeros(
+            [
+                self.anchor.shape[0] * self.config.n_offsets
+                - self.offset_gradient_accum.shape[0],
+                1,
+            ],
+            dtype=torch.int32,
+            device=self.offset_gradient_accum.device,
+        )
+        self.offset_gradient_accum = torch.cat(
+            [self.offset_gradient_accum, padding_offset_gradient_accum], dim=0
+        )
+
+        # # prune anchors
+        prune_mask = (self.opacity_accum < min_opacity * self.anchor_denom).squeeze(
+            dim=1
+        )
+        anchors_mask = (self.anchor_denom > check_interval * success_threshold).squeeze(
+            dim=1
+        )  # [N, 1]
+        prune_mask = torch.logical_and(prune_mask, anchors_mask).cuda()  # [N]
+
+        # update offset_denom
+        offset_denom = self.offset_denom.view([-1, self.config.n_offsets])[~prune_mask]
+        offset_denom = offset_denom.view([-1, 1])
+        del self.offset_denom
+        self.offset_denom = offset_denom
+
+        offset_gradient_accum = self.offset_gradient_accum.view(
+            [-1, self.config.n_offsets]
+        )[~prune_mask]
+        offset_gradient_accum = offset_gradient_accum.view([-1, 1])
+        del self.offset_gradient_accum
+        self.offset_gradient_accum = offset_gradient_accum
+
+        # update opacity accum
+        if anchors_mask.sum() > 0:
+            self.opacity_accum[anchors_mask] = (
+                torch.zeros([anchors_mask.sum(), 1]).float().cuda()
+            )
+            self.anchor_denom[anchors_mask] = (
+                torch.zeros([anchors_mask.sum(), 1]).float().cuda()
+            )
+
+        temp_opacity_accum = self.opacity_accum[~prune_mask]
+        del self.opacity_accum
+        self.opacity_accum = temp_opacity_accum
+
+        temp_anchor_denom = self.anchor_denom[~prune_mask]
+        del self.anchor_denom
+        self.anchor_denom = temp_anchor_denom
+
+        if prune_mask.shape[0] > 0:
+            self.prune_anchor(prune_mask)

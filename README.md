@@ -9,10 +9,10 @@ Unofficial implementation of [Scaffold-GS](https://github.com/city-super/Scaffol
 
 - [ ] Functionality
   - [x] Correctly rendering and training
-  - [ ] Anchor adjustment
+  - [x] Anchor adjustment
   - [ ] ...
 - [ ] Visualization
-  - [ ] Fix viser functionality
+  - [x] Fix viser functionality
   - [ ] ...
 - [ ] Extras
   - [ ] Mesh export
@@ -42,6 +42,8 @@ cd scaffold-gs-nerfstudio/
 pip install -e .
 ns-install-cli
 ```
+
+You must also install the correct torch_scatter for your environment ([https://pytorch-geometric.com/whl/torch-2.1.2%2Bcu118.html](https://pytorch-geometric.com/whl/torch-2.1.2%2Bcu118.html))
 
 ## Running Scaffold-GS
 This repository creates a new Nerfstudio method named "scaffold-gs". To train with it, run the command:
