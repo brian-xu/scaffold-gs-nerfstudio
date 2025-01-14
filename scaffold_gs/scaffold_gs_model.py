@@ -24,7 +24,6 @@ from nerfstudio.model_components.lib_bilagrid import color_correct
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.math import k_nearest_sklearn
-from nerfstudio.utils.misc import torch_compile
 
 
 def resize_image(image: torch.Tensor, d: int):
@@ -47,25 +46,6 @@ def resize_image(image: torch.Tensor, d: int):
         .squeeze(1)
         .permute(1, 2, 0)
     )
-
-
-@torch_compile()
-def get_viewmat(optimized_camera_to_world):
-    """
-    function that converts c2w to gsplat world2camera matrix, using compile for some speed
-    """
-    R = optimized_camera_to_world[:, :3, :3]  # 3 x 3
-    T = optimized_camera_to_world[:, :3, 3:4]  # 3 x 1
-    # flip the z and y axes to align with gsplat conventions
-    R = R * torch.tensor([[[1, -1, -1]]], device=R.device, dtype=R.dtype)
-    # analytic matrix inverse to get world2camera matrix
-    R_inv = R.transpose(1, 2)
-    T_inv = -torch.bmm(R_inv, T)
-    viewmat = torch.zeros(R.shape[0], 4, 4, device=R.device, dtype=R.dtype)
-    viewmat[:, 3, 3] = 1.0  # homogenous
-    viewmat[:, :3, :3] = R_inv
-    viewmat[:, :3, 3:4] = T_inv
-    return viewmat
 
 
 @dataclass
@@ -314,7 +294,7 @@ class ScaffoldGSModel(Model):
                 "opacity",
             ]:
                 dict[f"gauss_params.{p}"] = dict[p]
-        newp = dict["gauss_params.means"].shape[0]
+        newp = dict["gauss_params.anchor"].shape[0]
         for name, param in self.gauss_params.items():
             old_shape = param.shape
             new_shape = (newp,) + old_shape[1:]
@@ -464,7 +444,6 @@ class ScaffoldGSModel(Model):
         camera.rescale_output_resolution(1 / camera_scale_fac)
         W, H = int(camera.width.item()), int(camera.height.item())
         self.last_size = (H, W)
-
         background = self._get_background_color()
         voxel_visible_mask = prefilter_voxel(camera, self, background)
         retain_grad = self.step < self.config.update_until and self.step >= 0
@@ -499,11 +478,16 @@ class ScaffoldGSModel(Model):
         rgb = rearrange(render, "c h w -> h w c")
         rgb = torch.clamp(rgb, 0.0, 1.0)
 
+        depth = background.new_ones(*rgb.shape[:2], 1) * 10
+        accumulation = background.new_zeros(*rgb.shape[:2], 1)
+
         if background.shape[0] == 3 and not self.training:
             background = background.expand(H, W, 3)
 
         return {
             "rgb": rgb.squeeze(0),  # type: ignore
+            "depth": depth,  # type: ignore
+            "accumulation": accumulation,  # type: ignore
             "background": background,  # type: ignore
         }  # type: ignore
 

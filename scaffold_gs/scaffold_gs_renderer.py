@@ -93,9 +93,7 @@ def generate_neural_gaussians(viewpoint_camera, pc, visible_mask=None):
         if pc.config.add_color_dist:
             color = pc.color_mlp(torch.cat([cat_local_view, appearance], dim=1))
         else:
-            color = pc.color_mlp(
-                torch.cat([cat_local_view_wodist, appearance], dim=1)
-            )
+            color = pc.color_mlp(torch.cat([cat_local_view_wodist, appearance], dim=1))
     else:
         if pc.config.add_color_dist:
             color = pc.color_mlp(cat_local_view)
@@ -108,9 +106,7 @@ def generate_neural_gaussians(viewpoint_camera, pc, visible_mask=None):
         scale_rot = pc.cov_mlp(cat_local_view)
     else:
         scale_rot = pc.cov_mlp(cat_local_view_wodist)
-    scale_rot = scale_rot.reshape(
-        [anchor.shape[0] * pc.config.n_offsets, 7]
-    )  # [mask]
+    scale_rot = scale_rot.reshape([anchor.shape[0] * pc.config.n_offsets, 7])  # [mask]
 
     # offsets
     offsets = grid_offsets.view([-1, 3])  # [mask]
