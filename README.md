@@ -1,9 +1,7 @@
 # Scaffold-GS: Structured 3D Gaussians for View-Adaptive Rendering
 Unofficial implementation of [Scaffold-GS](https://github.com/city-super/Scaffold-GS) as a [nerfstudio](https://github.com/nerfstudio-project/nerfstudio) extension.
 
-![](teaser.png)
-
-(hopefully a placeholder)
+https://github.com/user-attachments/assets/f7194455-e4a0-4c60-9608-837ef635f22b
 
 ## Status
 
