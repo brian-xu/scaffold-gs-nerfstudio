@@ -66,7 +66,7 @@ class ScaffoldGSModelConfig(ModelConfig):
     update_init_factor: int = 100
     update_hierachy_factor: int = 4
     use_feat_bank: bool = False
-    appearance_dim: int = 32
+    appearance_dim: int = 0
     ratio: int = 1
     add_opacity_dist: bool = False
     add_cov_dist: bool = False
