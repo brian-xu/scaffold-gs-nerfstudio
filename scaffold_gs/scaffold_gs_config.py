@@ -27,7 +27,7 @@ scaffold_gs = MethodSpecification(
                 dataparser=NerfstudioDataParserConfig(load_3D_points=True),
                 cache_images_type="uint8",
             ),
-            model=ScaffoldGSModelConfig(appearance_dim=0),
+            model=ScaffoldGSModelConfig(),
         ),
         optimizers={
             "anchor": {

@@ -56,16 +56,19 @@ def generate_neural_gaussians(viewpoint_camera, pc, visible_mask=None):
 
     cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1)  # [N, c+3+1]p
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1)  # [N, c+3]
-    if (
-        pc.config.appearance_dim > 0
-        and viewpoint_camera.metadata is not None
-        and "cam_idx" in viewpoint_camera.metadata
-    ):
+    if pc.config.appearance_dim > 0:
+        if (
+            viewpoint_camera.metadata is not None
+            and "cam_idx" in viewpoint_camera.metadata
+        ):
+            cam_idx = viewpoint_camera.metadata["cam_idx"]
+        else:
+            cam_idx = 1
         camera_indicies = (
             torch.ones_like(
                 cat_local_view[:, 0], dtype=torch.long, device=ob_dist.device
             )
-            * viewpoint_camera.metadata["cam_idx"]
+            * cam_idx
         )
         # camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * 10
         appearance = pc.appearance(camera_indicies)
@@ -85,11 +88,7 @@ def generate_neural_gaussians(viewpoint_camera, pc, visible_mask=None):
     opacity = neural_opacity[mask]
 
     # get offset's color
-    if (
-        pc.config.appearance_dim > 0
-        and viewpoint_camera.metadata is not None
-        and "cam_idx" in viewpoint_camera.metadata
-    ):
+    if pc.config.appearance_dim > 0:
         if pc.config.add_color_dist:
             color = pc.color_mlp(torch.cat([cat_local_view, appearance], dim=1))
         else:
