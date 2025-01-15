@@ -16,7 +16,10 @@ from diff_scaffold_rasterization import (
     GaussianRasterizer,
 )
 from einops import repeat
-from scaffold_gs.gaussian_splatting.cameras import convert_to_colmap_camera
+from scaffold_gs.gaussian_splatting.cameras import (
+    build_rotation,
+    convert_to_colmap_camera,
+)
 
 
 def generate_neural_gaussians(viewpoint_camera, pc, visible_mask=None):
@@ -71,6 +74,7 @@ def generate_neural_gaussians(viewpoint_camera, pc, visible_mask=None):
             * cam_idx
         )
         # camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * 10
+        # TODO: interpolate camera indices for novel cameras
         appearance = pc.appearance(camera_indicies)
 
     # get offset's opacity
@@ -143,6 +147,8 @@ def scaffold_gs_render(
     scaling_modifier=1.0,
     visible_mask=None,
     retain_grad=False,
+    out_depth=False,
+    return_normal=False,
 ):
     """
     Render the scene.
@@ -199,9 +205,8 @@ def scaffold_gs_render(
         rotations=rot,
         cov3D_precomp=None,
     )
-
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
-    return {
+    return_dict = {
         "render": rendered_image,
         "viewspace_points": screenspace_points,
         "visibility_filter": radii > 0,
@@ -210,6 +215,56 @@ def scaffold_gs_render(
         "neural_opacity": neural_opacity,
         "scaling": scaling,
     }
+
+    if out_depth:
+        # Depth rendering from GSDF (https://github.com/city-super/GSDF)
+        # distance from 3D Gaussians to the camera.
+        depth = (
+            (xyz - colmap_camera.camera_center).norm(dim=1, keepdim=True).repeat([1, 3])
+        )
+        # Rasterize visible Gaussians to image, obtain predicted depth of Scaffold-GS
+        out = rasterizer(
+            means3D=xyz,
+            means2D=screenspace_points,
+            shs=None,
+            colors_precomp=depth,
+            opacities=opacity,
+            scales=scaling,
+            rotations=rot,
+            cov3D_precomp=None,
+        )
+        rendered_depth_hand = out[0]
+        return_dict.update({"depth_hand": rendered_depth_hand})
+
+    if return_normal:
+        # code from Gaussian-pro (https://github.com/kcheng1021/GaussianPro)
+        # Get the predicted normals of Scaffold-GS
+        rotations_mat = build_rotation(rot)
+        scales = scaling
+        min_scales = torch.argmin(scales, dim=1)
+        indices = torch.arange(min_scales.shape[0])
+        normal = rotations_mat[indices, :, min_scales]
+
+        view_dir = xyz - viewpoint_camera.camera_center
+        normal = (
+            normal * ((((view_dir * normal).sum(dim=-1) < 0) * 1 - 0.5) * 2)[..., None]
+        )
+        out = rasterizer(
+            means3D=xyz,
+            means2D=screenspace_points,
+            shs=None,
+            colors_precomp=normal,
+            opacities=opacity,
+            scales=scales,
+            rotations=rot,
+            cov3D_precomp=None,
+        )
+        render_normal = out[0]
+        render_normal = torch.nn.functional.normalize(render_normal, dim=0)
+
+        return_dict.update({"gs_normal": render_normal})
+
+    return return_dict
 
 
 def prefilter_voxel(

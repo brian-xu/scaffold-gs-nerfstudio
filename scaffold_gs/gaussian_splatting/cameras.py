@@ -120,3 +120,29 @@ def convert_to_colmap_camera(camera: NerfstudioCamera):
     fovy = focal2fov(K[0, 1, 1], H)
 
     return ColmapCamera(R=R, T=T, FoVx=fovx, FoVy=fovy, image_height=H, image_width=W)
+
+
+def build_rotation(r):
+    norm = torch.sqrt(
+        r[:, 0] * r[:, 0] + r[:, 1] * r[:, 1] + r[:, 2] * r[:, 2] + r[:, 3] * r[:, 3]
+    )
+
+    q = r / norm[:, None]
+
+    R = torch.zeros((q.size(0), 3, 3), device="cuda")
+
+    r = q[:, 0]
+    x = q[:, 1]
+    y = q[:, 2]
+    z = q[:, 3]
+
+    R[:, 0, 0] = 1 - 2 * (y * y + z * z)
+    R[:, 0, 1] = 2 * (x * y - r * z)
+    R[:, 0, 2] = 2 * (x * z + r * y)
+    R[:, 1, 0] = 2 * (x * y + r * z)
+    R[:, 1, 1] = 1 - 2 * (x * x + z * z)
+    R[:, 1, 2] = 2 * (y * z - r * x)
+    R[:, 2, 0] = 2 * (x * z - r * y)
+    R[:, 2, 1] = 2 * (y * z + r * x)
+    R[:, 2, 2] = 1 - 2 * (x * x + y * y)
+    return R

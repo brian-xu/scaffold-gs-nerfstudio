@@ -466,8 +466,8 @@ class ScaffoldGSModel(Model):
             background,
             visible_mask=voxel_visible_mask,
             retain_grad=retain_grad,
+            out_depth=True,
         )
-
         camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
 
         (
@@ -478,6 +478,7 @@ class ScaffoldGSModel(Model):
             radii,
             scaling,
             opacity,
+            gs_depth_hand,
         ) = (
             render_pkg["render"],
             render_pkg["viewspace_points"],
@@ -486,6 +487,7 @@ class ScaffoldGSModel(Model):
             render_pkg["radii"],
             render_pkg["scaling"],
             render_pkg["neural_opacity"],
+            render_pkg["depth_hand"],
         )
 
         self.viewspace_point_tensor = viewspace_point_tensor
@@ -497,7 +499,7 @@ class ScaffoldGSModel(Model):
         rgb = rearrange(render, "c h w -> h w c")
         rgb = torch.clamp(rgb, 0.0, 1.0)
 
-        depth = background.new_ones(*rgb.shape[:2], 1) * 10
+        depth = rearrange(gs_depth_hand, "c h w -> h w c")[..., 0] * 1000
         accumulation = background.new_zeros(*rgb.shape[:2], 1)
 
         if background.shape[0] == 3 and not self.training:
@@ -505,7 +507,7 @@ class ScaffoldGSModel(Model):
 
         return {
             "rgb": rgb.squeeze(0),  # type: ignore
-            "depth": depth,  # type: ignore
+            "depth": depth.unsqueeze(-1),  # type: ignore
             "accumulation": accumulation,  # type: ignore
             "background": background,  # type: ignore
         }  # type: ignore
