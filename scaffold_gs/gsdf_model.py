@@ -1,9 +1,8 @@
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 from functools import reduce
-from typing import Dict, List, Literal, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union
 
+import numpy as np
 import torch
 from einops import rearrange
 from pytorch_msssim import SSIM
@@ -13,6 +12,7 @@ from torch_scatter import scatter_max
 
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
+from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.engine.callbacks import (
     TrainingCallback,
@@ -21,9 +21,11 @@ from nerfstudio.engine.callbacks import (
 )
 from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.field_components.embedding import Embedding
+from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.mlp import MLP
 from nerfstudio.model_components.lib_bilagrid import color_correct
-from nerfstudio.models.base_model import Model, ModelConfig
+from nerfstudio.model_components.ray_samplers import VolumetricSampler
+from nerfstudio.models.neus_facto import NeuSFactoModel, NeuSFactoModelConfig
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.math import k_nearest_sklearn
 
@@ -55,15 +57,15 @@ def inverse_sigmoid(x):
 
 
 @dataclass
-class ScaffoldGSModelConfig(ModelConfig):
-    """Scaffold-GS Model Config"""
+class GSDFModelConfig(NeuSFactoModelConfig):
+    """GSDF Model Config"""
 
-    _target: Type = field(default_factory=lambda: ScaffoldGSModel)
+    _target: Type = field(default_factory=lambda: GSDFModel)
     feat_dim: int = 32
-    n_offsets: int = 5
-    voxel_size: float = 0.01
+    n_offsets: int = 10
+    voxel_size: float = 0.001
     update_depth: int = 3
-    update_init_factor: int = 100
+    update_init_factor: int = 16
     update_hierachy_factor: int = 4
     use_feat_bank: bool = False
     appearance_dim: int = 0
@@ -75,7 +77,7 @@ class ScaffoldGSModelConfig(ModelConfig):
     start_stat: int = 500
     update_from: int = 1500
     update_interval: int = 100
-    update_until: int = 15_000
+    update_until: int = 30_000
     warmup_length: int = 500
     # densification config
     min_opacity = 0.005
@@ -108,14 +110,14 @@ class ScaffoldGSModelConfig(ModelConfig):
     """If True, apply color correction to the rendered images before computing the metrics."""
 
 
-class ScaffoldGSModel(Model):
-    """Nerfstudio implementation of Scaffold-GS
+class GSDFModel(NeuSFactoModel):
+    """Nerfstudio implementation of GSDF
 
     Args:
-        config: Scaffold-GS configuration to instantiate model
+        config: GSDF configuration to instantiate model
     """
 
-    config: ScaffoldGSModelConfig
+    config: GSDFModelConfig
 
     def __init__(
         self,
@@ -127,6 +129,7 @@ class ScaffoldGSModel(Model):
         super().__init__(*args, **kwargs)
 
     def populate_modules(self):
+        super().populate_modules()
 
         if self.seed_points is not None and not self.config.random_init:
             anchor = torch.nn.Parameter(self.seed_points[0])
@@ -242,6 +245,8 @@ class ScaffoldGSModel(Model):
         else:
             self.background_color = get_color(self.config.background_color)
 
+        # TODO: Add gaussian volumetric sampler
+
     @property
     def num_points(self):
         return self.anchor.shape[0]
@@ -292,7 +297,7 @@ class ScaffoldGSModel(Model):
 
     def load_state_dict(self, dict, **kwargs):  # type: ignore
         # resize the parameters to match the new number of points
-        self.step = 30000
+        self.step = 45000
         if "anchor" in dict:
             # For backwards compatibility, we remap the names of parameters from
             # means->gauss_params.means since old checkpoints have that format
@@ -340,7 +345,7 @@ class ScaffoldGSModel(Model):
     def get_training_callbacks(
         self, training_callback_attributes: TrainingCallbackAttributes
     ) -> List[TrainingCallback]:
-        cbs = []
+        cbs = super().get_training_callbacks(training_callback_attributes)
         cbs.append(
             TrainingCallback(
                 [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
@@ -356,25 +361,49 @@ class ScaffoldGSModel(Model):
         )
         return cbs
 
+    def sample_and_forward_field(self, ray_bundle: RayBundle) -> Dict[str, Any]:
+        """Sample rays using proposal networks and compute the corresponding field outputs."""
+        # TODO: use volumetric sampler
+        ray_samples, weights_list, ray_samples_list = self.proposal_sampler(
+            ray_bundle, density_fns=self.density_fns
+        )
+
+        field_outputs = self.field(ray_samples, return_alphas=True)
+        weights, transmittance = ray_samples.get_weights_and_transmittance_from_alphas(
+            field_outputs[FieldHeadNames.ALPHA]
+        )
+        bg_transmittance = transmittance[:, -1, :]
+
+        weights_list.append(weights)
+        ray_samples_list.append(ray_samples)
+
+        samples_and_field_outputs = {
+            "ray_samples": ray_samples,
+            "field_outputs": field_outputs,
+            "weights": weights,
+            "bg_transmittance": bg_transmittance,
+            "weights_list": weights_list,
+            "ray_samples_list": ray_samples_list,
+        }
+        return samples_and_field_outputs
+
     def step_cb(self, optimizers: Optimizers, step):
         self.step = step
         self.optimizers = optimizers.optimizers
         self.schedulers = optimizers.schedulers
 
-    def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
+    def get_gaussian_param_groups(self, param_groups) -> Dict[str, List[Parameter]]:
         # Here we explicitly use the means, scales as parameters so that the user can override this function and
         # specify more if they want to add more optimizable params to gaussians.
-        return {
-            name: [self.gauss_params[name]]
-            for name in [
-                "anchor",
-                "offset",
-                "anchor_feat",
-                "scaling",
-                "rotation",
-                "opacity",
-            ]
-        }
+        for name in [
+            "anchor",
+            "offset",
+            "anchor_feat",
+            "scaling",
+            "rotation",
+            "opacity",
+        ]:
+            param_groups[name] = [self.gauss_params[name]]
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         """Obtain the parameter groups for the optimizers
@@ -382,14 +411,15 @@ class ScaffoldGSModel(Model):
         Returns:
             Mapping of different parameter groups
         """
-        gps = self.get_gaussian_param_groups()
-        self.camera_optimizer.get_param_groups(param_groups=gps)
-        gps["mlp_opacity"] = list(self.opacity_mlp.parameters())
-        gps["mlp_feature_bank"] = list(self.featurebank_mlp.parameters())
-        gps["mlp_cov"] = list(self.mlp_cov.parameters())
-        gps["mlp_color"] = list(self.mlp_color.parameters())
-        gps["embedding_appearance"] = list(self.appearance.parameters())
-        return gps
+        param_groups = super().get_param_groups()
+        self.get_gaussian_param_groups(param_groups=param_groups)
+        self.camera_optimizer.get_param_groups(param_groups=param_groups)
+        param_groups["mlp_opacity"] = list(self.opacity_mlp.parameters())
+        param_groups["mlp_feature_bank"] = list(self.featurebank_mlp.parameters())
+        param_groups["mlp_cov"] = list(self.mlp_cov.parameters())
+        param_groups["mlp_color"] = list(self.mlp_color.parameters())
+        param_groups["embedding_appearance"] = list(self.appearance.parameters())
+        return param_groups
 
     def _get_downscale_factor(self):
         if self.training:
@@ -438,6 +468,7 @@ class ScaffoldGSModel(Model):
         return background
 
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
+        # TODO: do neus-facto stuff
         """Takes in a camera and returns a dictionary of outputs.
 
         Args:
@@ -504,6 +535,12 @@ class ScaffoldGSModel(Model):
         if background.shape[0] == 3 and not self.training:
             background = background.expand(H, W, 3)
 
+        # TODO: NeuS stuff
+        ray_bundle = camera.generate_rays(
+            camera_indices=0, keep_shape=True, obb_box=self.crop_box
+        )
+        samples_and_field_outputs = self.sample_and_forward_field(ray_bundle=ray_bundle)
+
         return {
             "rgb": rgb.squeeze(0),  # type: ignore
             "depth": depth.unsqueeze(-1),  # type: ignore
@@ -536,6 +573,7 @@ class ScaffoldGSModel(Model):
             return image
 
     def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
+        # TODO: do neus-facto stuff
         """Compute and returns metrics.
 
         Args:
@@ -561,6 +599,7 @@ class ScaffoldGSModel(Model):
     def get_loss_dict(
         self, outputs, batch, metrics_dict=None
     ) -> Dict[str, torch.Tensor]:
+        # TODO: do neus-facto stuff
         """Computes and returns the losses dict.
 
         Args:
@@ -617,6 +656,7 @@ class ScaffoldGSModel(Model):
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
+        # TODO: do neus-facto stuff
         """Writes the test image outputs.
 
         Args:
@@ -969,15 +1009,37 @@ class ScaffoldGSModel(Model):
 
     def adjust_anchor(
         self,
+        add_contents=None,
         check_interval=100,
         success_threshold=0.8,
         grad_threshold=0.0002,
         min_opacity=0.005,
+        xyz_sdf=None,
+        anchor_sdf=None,
+        inside_box=None,
+        anchor_inside_box=None,
+        growing_weight=0.0002,
     ):
+
+        if xyz_sdf is not None:
+            # Activate function (Gaussian) for sdf.
+            def simple_sdf_activate(x, sigma=0.01):
+                return torch.exp(-(x**2) / sigma)
+
         # # adding anchors
         grads = self.offset_gradient_accum / self.offset_denom  # [N*k, 1]
         grads[grads.isnan()] = 0.0
+
         grads_norm = torch.norm(grads, dim=-1)
+
+        if xyz_sdf is not None:
+            xyz_sdf_activated = simple_sdf_activate(xyz_sdf)
+            xyz_sdf_activated[~inside_box] = 0.0
+            grow_alpha = growing_weight  # 0.0002
+            weight_prune = 1
+            # update the grads_norm according to the sdf value
+            grads_norm = grads_norm + grow_alpha * xyz_sdf_activated
+
         offset_mask = (
             self.offset_denom > check_interval * success_threshold * 0.5
         ).squeeze(dim=1)
@@ -1011,14 +1073,37 @@ class ScaffoldGSModel(Model):
             [self.offset_gradient_accum, padding_offset_gradient_accum], dim=0
         )
 
+        anchor_opacity_sdf_accum = self.opacity_accum
+
+        if anchor_sdf is not None:
+
+            anchor_sdf_activated = simple_sdf_activate(anchor_sdf)
+            anchor_sdf_activated[~anchor_inside_box] = 1
+            padding_length = self.get_anchor.shape[0] - anchor_sdf_activated.shape[0]
+            padding_ones = torch.ones([padding_length]).to(self.get_anchor.device)
+            padded_anchor_sdf_activated = torch.cat(
+                [anchor_sdf_activated, padding_ones], dim=0
+            )
+            # update the opacity_accum with the anchor sdf value.
+            anchor_opacity_sdf_accum = (
+                self.opacity_accum
+                - weight_prune
+                * self.anchor_demon
+                * (1 - padded_anchor_sdf_activated.unsqueeze(dim=1))
+            )
+
         # # prune anchors
-        prune_mask = (self.opacity_accum < min_opacity * self.anchor_denom).squeeze(
-            dim=1
-        )
-        anchors_mask = (self.anchor_denom > check_interval * success_threshold).squeeze(
+        prune_mask = (
+            anchor_opacity_sdf_accum < min_opacity * self.anchor_demon
+        ).squeeze(dim=1)
+        anchors_mask = (self.anchor_demon > check_interval * success_threshold).squeeze(
             dim=1
         )  # [N, 1]
-        prune_mask = torch.logical_and(prune_mask, anchors_mask).cuda()  # [N]
+        prune_mask = torch.logical_and(prune_mask, anchors_mask)  # [N]
+
+        extent = self.scene_box.get_diagonal_length() * 0.55
+        scaling_mask = self.get_scaling.max(dim=1).values > 0.1 * extent
+        prune_mask = torch.logical_and(prune_mask, scaling_mask)  # [N]
 
         # update offset_denom
         offset_denom = self.offset_denom.view([-1, self.config.n_offsets])[~prune_mask]
