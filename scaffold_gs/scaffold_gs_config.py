@@ -66,35 +66,11 @@ scaffold_gs = MethodSpecification(
                     max_steps=30000,
                 ),
             },
-            "mlp_opacity": {
-                "optimizer": AdamOptimizerConfig(lr=0.002, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_pre_warmup=0.002,
-                    lr_final=0.00002,
-                    max_steps=30000,
-                ),
-            },
             "mlp_cov": {
                 "optimizer": AdamOptimizerConfig(lr=0.004, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(
                     lr_pre_warmup=0.004,
                     lr_final=0.004,
-                    max_steps=30000,
-                ),
-            },
-            "mlp_cov": {
-                "optimizer": AdamOptimizerConfig(lr=0.004, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_pre_warmup=0.004,
-                    lr_final=0.004,
-                    max_steps=30000,
-                ),
-            },
-            "mlp_color": {
-                "optimizer": AdamOptimizerConfig(lr=0.008, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_pre_warmup=0.008,
-                    lr_final=0.00005,
                     max_steps=30000,
                 ),
             },
