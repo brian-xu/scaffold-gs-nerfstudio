@@ -246,6 +246,8 @@ class GSDFModel(NeuSFactoModel):
             self.background_color = get_color(self.config.background_color)
 
         # TODO: Add gaussian volumetric sampler
+        self.ray_collider = self.collider
+        self.collider = None
 
     @property
     def num_points(self):
@@ -482,6 +484,10 @@ class GSDFModel(NeuSFactoModel):
             print("Called get_outputs with not a camera")
             return {}
 
+        # during eval the camera gets clone for each raybundle for some reason
+        if camera.shape[0] > 1:
+            camera = camera[:1]
+
         assert camera.shape[0] == 1, "Only one camera at a time"
         camera_scale_fac = self._get_downscale_factor()
         camera.rescale_output_resolution(1 / camera_scale_fac)
@@ -536,10 +542,10 @@ class GSDFModel(NeuSFactoModel):
             background = background.expand(H, W, 3)
 
         # TODO: NeuS stuff
-        ray_bundle = camera.generate_rays(
-            camera_indices=0, keep_shape=True, obb_box=self.crop_box
+        ray_bundle = camera.metadata["ray_bundle"]
+        samples_and_field_outputs = self.sample_and_forward_field(
+            ray_bundle=self.ray_collider(ray_bundle)
         )
-        samples_and_field_outputs = self.sample_and_forward_field(ray_bundle=ray_bundle)
 
         return {
             "rgb": rgb.squeeze(0),  # type: ignore
@@ -764,6 +770,8 @@ class GSDFModel(NeuSFactoModel):
                 or "conv" in optim_name
                 or "feat_base" in optim_name
                 or "embedding" in optim_name
+                or "field" in optim_name
+                or "proposal" in optim_name
             ):
                 continue
             optim = self.optimizers[optim_name]
@@ -806,6 +814,8 @@ class GSDFModel(NeuSFactoModel):
                 or "conv" in optim_name
                 or "feat_base" in optim_name
                 or "embedding" in optim_name
+                or "field" in optim_name
+                or "proposal" in optim_name
             ):
                 continue
 
@@ -1088,21 +1098,21 @@ class GSDFModel(NeuSFactoModel):
             anchor_opacity_sdf_accum = (
                 self.opacity_accum
                 - weight_prune
-                * self.anchor_demon
+                * self.anchor_denom
                 * (1 - padded_anchor_sdf_activated.unsqueeze(dim=1))
             )
 
         # # prune anchors
         prune_mask = (
-            anchor_opacity_sdf_accum < min_opacity * self.anchor_demon
+            anchor_opacity_sdf_accum < min_opacity * self.anchor_denom
         ).squeeze(dim=1)
-        anchors_mask = (self.anchor_demon > check_interval * success_threshold).squeeze(
+        anchors_mask = (self.anchor_denom > check_interval * success_threshold).squeeze(
             dim=1
         )  # [N, 1]
         prune_mask = torch.logical_and(prune_mask, anchors_mask)  # [N]
 
         extent = self.scene_box.get_diagonal_length() * 0.55
-        scaling_mask = self.get_scaling.max(dim=1).values > 0.1 * extent
+        scaling_mask = self.scaling.max(dim=1).values > 0.1 * extent
         prune_mask = torch.logical_and(prune_mask, scaling_mask)  # [N]
 
         # update offset_denom
