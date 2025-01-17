@@ -245,7 +245,7 @@ def scaffold_gs_render(
         indices = torch.arange(min_scales.shape[0])
         normal = rotations_mat[indices, :, min_scales]
 
-        view_dir = xyz - viewpoint_camera.camera_center
+        view_dir = xyz - colmap_camera.camera_center
         normal = (
             normal * ((((view_dir * normal).sum(dim=-1) < 0) * 1 - 0.5) * 2)[..., None]
         )

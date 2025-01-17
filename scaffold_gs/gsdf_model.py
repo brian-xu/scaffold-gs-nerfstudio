@@ -1,8 +1,7 @@
 from dataclasses import dataclass, field
 from functools import reduce
-from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union, cast
 
-import numpy as np
 import torch
 from einops import rearrange
 from pytorch_msssim import SSIM
@@ -24,10 +23,18 @@ from nerfstudio.field_components.embedding import Embedding
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.mlp import MLP
 from nerfstudio.model_components.lib_bilagrid import color_correct
-from nerfstudio.model_components.ray_samplers import VolumetricSampler
+from nerfstudio.model_components.losses import interlevel_loss
 from nerfstudio.models.neus_facto import NeuSFactoModel, NeuSFactoModelConfig
+from nerfstudio.utils import colormaps
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.math import k_nearest_sklearn
+
+
+def cos_similarity_loss(a, b):
+    return (
+        1.0
+        - ((a * b).sum(dim=-1) / (a.norm(dim=-1) * b.norm(dim=-1) + 1e-8)).abs().mean()
+    )
 
 
 def resize_image(image: torch.Tensor, d: int):
@@ -80,10 +87,11 @@ class GSDFModelConfig(NeuSFactoModelConfig):
     update_until: int = 30_000
     warmup_length: int = 500
     # densification config
-    min_opacity = 0.005
-    success_threshold = 0.8
-    densify_grad_threshold = 0.0002
-    """period of steps where gaussians are culled and densified"""
+    min_opacity: float = 0.005
+    success_threshold: float = 0.8
+    densify_grad_threshold: float = 0.0002
+    scaffold_gs_pretrain: int = 1500
+
     resolution_schedule: int = 3000
     """training starts at 1/d resolution, every n steps this is doubled"""
     background_color: Literal["random", "black", "white"] = "random"
@@ -503,6 +511,7 @@ class GSDFModel(NeuSFactoModel):
             visible_mask=voxel_visible_mask,
             retain_grad=retain_grad,
             out_depth=True,
+            return_normal=True,
         )
         camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
 
@@ -515,6 +524,7 @@ class GSDFModel(NeuSFactoModel):
             scaling,
             opacity,
             gs_depth_hand,
+            gs_normal,
         ) = (
             render_pkg["render"],
             render_pkg["viewspace_points"],
@@ -524,6 +534,7 @@ class GSDFModel(NeuSFactoModel):
             render_pkg["scaling"],
             render_pkg["neural_opacity"],
             render_pkg["depth_hand"],
+            render_pkg["gs_normal"],
         )
 
         self.viewspace_point_tensor = viewspace_point_tensor
@@ -537,22 +548,63 @@ class GSDFModel(NeuSFactoModel):
 
         depth = rearrange(gs_depth_hand, "c h w -> h w c")[..., 0] * 1000
         accumulation = background.new_zeros(*rgb.shape[:2], 1)
+        normal = rearrange(gs_normal, "c h w -> h w c")
 
         if background.shape[0] == 3 and not self.training:
             background = background.expand(H, W, 3)
 
-        # TODO: NeuS stuff
-        ray_bundle = camera.metadata["ray_bundle"]
-        samples_and_field_outputs = self.sample_and_forward_field(
-            ray_bundle=self.ray_collider(ray_bundle)
-        )
-
-        return {
+        return_dict = {
             "rgb": rgb.squeeze(0),  # type: ignore
             "depth": depth.unsqueeze(-1),  # type: ignore
             "accumulation": accumulation,  # type: ignore
             "background": background,  # type: ignore
         }  # type: ignore
+
+        if (
+            self.step > self.config.scaffold_gs_pretrain
+            and "ray_bundle" in camera.metadata
+        ):
+            ray_bundle = camera.metadata["ray_bundle"]
+            ray_x_indices = camera.metadata["indices"][:, 2] // camera_scale_fac
+            ray_x_indices = torch.clamp(ray_x_indices, min=0, max=W - 1).int()
+            ray_y_indices = camera.metadata["indices"][:, 1] // camera_scale_fac
+            ray_y_indices = torch.clamp(ray_y_indices, min=0, max=H - 1).int()
+            samples_and_field_outputs = self.sample_and_forward_field(
+                ray_bundle=self.ray_collider(ray_bundle)
+            )
+            field_outputs: Dict[FieldHeadNames, torch.Tensor] = cast(
+                Dict[FieldHeadNames, torch.Tensor],
+                samples_and_field_outputs["field_outputs"],
+            )
+            grad_points = field_outputs[FieldHeadNames.GRADIENT]
+            ray_samples = samples_and_field_outputs["ray_samples"]
+            weights = samples_and_field_outputs["weights"]
+
+            neus_rgb = self.renderer_rgb(
+                rgb=field_outputs[FieldHeadNames.RGB], weights=weights
+            )
+            gs_rgb = rgb[ray_y_indices, ray_x_indices].detach()
+            neus_depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
+            # the rendered depth is point-to-point distance and we should convert to depth
+            neus_depth = neus_depth / ray_bundle.metadata["directions_norm"]
+            gs_depth = depth[ray_y_indices, ray_x_indices].detach()
+            neus_normal = self.renderer_normal(
+                semantics=field_outputs[FieldHeadNames.NORMALS], weights=weights
+            )
+            gs_normal = normal[ray_y_indices, ray_x_indices].detach()
+
+            return_dict["neus_info"] = (
+                neus_rgb,
+                gs_rgb,
+                neus_depth,
+                gs_depth,
+                neus_normal,
+                gs_normal,
+            )
+            return_dict.update(samples_and_field_outputs)
+            return_dict["eik_grad"] = grad_points
+
+        return return_dict
 
     def get_gt_img(self, image: torch.Tensor):
         """Compute groundtruth image with iteration dependent downscale factor for evaluation purpose
@@ -641,6 +693,31 @@ class GSDFModel(NeuSFactoModel):
         if self.training:
             # Add loss from camera optimizer
             self.camera_optimizer.get_loss_dict(loss_dict)
+
+        if self.step > self.config.scaffold_gs_pretrain:
+            (
+                neus_rgb,
+                gs_rgb,
+                neus_depth,
+                gs_depth,
+                neus_normal,
+                gs_normal,
+            ) = outputs["neus_info"]
+            loss_dict["interlevel_loss"] = (
+                self.config.interlevel_loss_mult
+                * interlevel_loss(outputs["weights_list"], outputs["ray_samples_list"])
+            )
+            loss_dict["neus_loss"] = (
+                torch.abs(neus_rgb - gs_rgb).mean()
+                + torch.abs(neus_depth - gs_depth).mean()
+                * self.config.mono_depth_loss_mult
+                + cos_similarity_loss(neus_normal, gs_normal).mean()
+                * self.config.mono_normal_loss_mult
+            )
+            grad_theta = outputs["eik_grad"]
+            loss_dict["eikonal_loss"] = (
+                (grad_theta.norm(2, dim=-1) - 1) ** 2
+            ).mean() * self.config.eikonal_loss_mult
 
         return loss_dict
 

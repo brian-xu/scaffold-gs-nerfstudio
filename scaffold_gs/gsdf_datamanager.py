@@ -57,6 +57,8 @@ class GSDFDataManagerConfig(FullImageDatamanagerConfig):
     """Size of patch to sample from. If > 1, patch-based sampling will be used."""
     pixel_sampler: PixelSamplerConfig = field(default_factory=PixelSamplerConfig)
     """Specifies the pixel sampler used to sample pixels from images."""
+    scaffold_gs_pretrain: int = 15000
+    """How many steps to pretrain the Scaffold-GS model before dual training."""
 
 
 class GSDFDataManager(FullImageDatamanager):
@@ -143,32 +145,34 @@ class GSDFDataManager(FullImageDatamanager):
         """Returns the next batch of data from the train dataloader."""
         camera, data = super().next_train(step)
         self.train_count += 1
-        assert self.train_pixel_sampler is not None
-        assert isinstance(data, dict)
-        data["image"] = data["image"].unsqueeze(0)
-        data["image_idx"] = torch.Tensor([data["image_idx"]])
-        batch = self.train_pixel_sampler.sample(data)
-        ray_indices = batch["indices"]
-        ray_bundle = self.train_ray_generator(ray_indices)
-        data["image"] = data["image"].squeeze(0)
-        camera.metadata["raycast_image"] = batch["image"]
-        camera.metadata["indices"] = batch["indices"]
-        camera.metadata["ray_bundle"] = ray_bundle
+        if step > self.config.scaffold_gs_pretrain:
+            assert self.train_pixel_sampler is not None
+            assert isinstance(data, dict)
+            data["image"] = data["image"].unsqueeze(0)
+            data["image_idx"] = torch.Tensor([data["image_idx"]])
+            batch = self.train_pixel_sampler.sample(data)
+            ray_indices = batch["indices"]
+            ray_bundle = self.train_ray_generator(ray_indices)
+            data["image"] = data["image"].squeeze(0)
+            camera.metadata["raycast_image"] = batch["image"]
+            camera.metadata["indices"] = batch["indices"]
+            camera.metadata["ray_bundle"] = ray_bundle
         return camera, data
 
     def next_eval_image(self, step: int) -> Tuple[Cameras, Dict]:
         """Returns the next batch of data from the eval dataloader."""
         camera, data = super().next_eval_image(step)
         self.eval_count += 1
-        assert self.eval_pixel_sampler is not None
-        assert isinstance(data, dict)
-        data["image"] = data["image"].unsqueeze(0)
-        data["image_idx"] = torch.Tensor([data["image_idx"]])
-        batch = self.eval_pixel_sampler.sample(data)
-        ray_indices = batch["indices"]
-        ray_bundle = self.eval_ray_generator(ray_indices)
-        data["image"] = data["image"].squeeze(0)
-        camera.metadata["raycast_image"] = batch["image"]
-        camera.metadata["indices"] = batch["indices"]
-        camera.metadata["ray_bundle"] = ray_bundle
+        if step > self.config.scaffold_gs_pretrain:
+            assert self.eval_pixel_sampler is not None
+            assert isinstance(data, dict)
+            data["image"] = data["image"].unsqueeze(0)
+            data["image_idx"] = torch.Tensor([data["image_idx"]])
+            batch = self.eval_pixel_sampler.sample(data)
+            ray_indices = batch["indices"]
+            ray_bundle = self.eval_ray_generator(ray_indices)
+            data["image"] = data["image"].squeeze(0)
+            camera.metadata["raycast_image"] = batch["image"]
+            camera.metadata["indices"] = batch["indices"]
+            camera.metadata["ray_bundle"] = ray_bundle
         return camera, data
