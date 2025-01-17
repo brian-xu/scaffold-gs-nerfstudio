@@ -4,14 +4,16 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union, cast
 
 import torch
 from einops import rearrange
+from jaxtyping import Shaped
 from pytorch_msssim import SSIM
 from scaffold_gs.scaffold_gs_renderer import prefilter_voxel, scaffold_gs_render
+from torch import Tensor
 from torch.nn import Parameter
 from torch_scatter import scatter_max
 
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
-from nerfstudio.cameras.rays import RayBundle
+from nerfstudio.cameras.rays import Frustums, RayBundle, RaySamples
 from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.engine.callbacks import (
     TrainingCallback,
@@ -25,7 +27,6 @@ from nerfstudio.field_components.mlp import MLP
 from nerfstudio.model_components.lib_bilagrid import color_correct
 from nerfstudio.model_components.losses import interlevel_loss
 from nerfstudio.models.neus_facto import NeuSFactoModel, NeuSFactoModelConfig
-from nerfstudio.utils import colormaps
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.math import k_nearest_sklearn
 
@@ -34,6 +35,24 @@ def cos_similarity_loss(a, b):
     return (
         1.0
         - ((a * b).sum(dim=-1) / (a.norm(dim=-1) * b.norm(dim=-1) + 1e-8)).abs().mean()
+    )
+
+
+def rays_from_positions(positions: Shaped[Tensor, "*bs 3"]) -> Shaped[Tensor, "*bs 1"]:
+    """Returns ray samples casting to an exact position.
+
+    Args:
+        positions: the origin of the samples/frustums
+    """
+    return RaySamples(
+        camera_indices=torch.zeros(1).int().to(device=positions.device),
+        frustums=Frustums(
+            origins=positions,
+            directions=torch.ones_like(positions),
+            starts=torch.zeros_like(positions[..., :1]),
+            ends=torch.zeros_like(positions[..., :1]),
+            pixel_area=torch.ones_like(positions[..., :1]),
+        ),
     )
 
 
@@ -90,7 +109,7 @@ class GSDFModelConfig(NeuSFactoModelConfig):
     min_opacity: float = 0.005
     success_threshold: float = 0.8
     densify_grad_threshold: float = 0.0002
-    scaffold_gs_pretrain: int = 1500
+    scaffold_gs_pretrain: int = 15_000
 
     resolution_schedule: int = 3000
     """training starts at 1/d resolution, every n steps this is doubled"""
@@ -345,11 +364,66 @@ class GSDFModel(NeuSFactoModel):
             and step > self.config.update_from
             and step % self.config.update_interval == 0
         ):
+            if step > self.config.scaffold_gs_pretrain + self.config.warmup_length:
+                scaling = self.scaling[:, :3]
+                scaling_repeat = (
+                    scaling.unsqueeze(dim=1)
+                    .repeat([1, self.config.n_offsets, 1])
+                    .view([-1, 3])
+                )
+                gs_positions = (
+                    self.anchor.unsqueeze(dim=1)
+                    .repeat([1, self.config.n_offsets, 1])
+                    .view([-1, 3])
+                    + self.offset.view([-1, 3]) * scaling_repeat
+                )
+
+                min_point = torch.tensor(
+                    self.scene_box.aabb[0],
+                    device=gs_positions.device,
+                )
+                max_point = torch.tensor(
+                    self.scene_box.aabb[1],
+                    device=gs_positions.device,
+                )
+                inside_box = (gs_positions > min_point) & (gs_positions < max_point)
+                inside_box = inside_box.all(dim=1)
+
+                inside_positions = gs_positions[inside_box]
+                # set the sdf of 3D gaussians in the background to 100000.
+                xyz_sdf = (
+                    torch.ones(gs_positions.shape[0]).to(gs_positions.device) * 100000
+                )
+                # calculate the sdf of 3D Gaussians in the frontground.
+                inside_xyz_sdf = self.field(rays_from_positions(inside_positions))[
+                    FieldHeadNames.SDF
+                ]
+
+                xyz_sdf[inside_box] = inside_xyz_sdf[:, 0]
+                # calculate the sdf of anchor points in the frontground
+                anchor_positions = self.anchor
+                anchor_inside_box = (anchor_positions > min_point) & (
+                    anchor_positions < max_point
+                )
+                anchor_inside_box = anchor_inside_box.all(dim=1)
+                anchor_sdf = self.field(rays_from_positions(anchor_positions))[
+                    FieldHeadNames.SDF
+                ][:, 0]
+                print("success")
+            else:
+                xyz_sdf = None
+                anchor_sdf = None
+                inside_box = None
+                anchor_inside_box = None
             self.adjust_anchor(
                 check_interval=self.config.update_interval,
                 success_threshold=self.config.success_threshold,
                 grad_threshold=self.config.densify_grad_threshold,
                 min_opacity=self.config.min_opacity,
+                xyz_sdf=xyz_sdf,
+                anchor_sdf=anchor_sdf,
+                inside_box=inside_box,
+                anchor_inside_box=anchor_inside_box,
             )
 
     def get_training_callbacks(
@@ -583,15 +657,15 @@ class GSDFModel(NeuSFactoModel):
             neus_rgb = self.renderer_rgb(
                 rgb=field_outputs[FieldHeadNames.RGB], weights=weights
             )
-            gs_rgb = rgb[ray_y_indices, ray_x_indices].detach()
+            gs_rgb = rgb[ray_y_indices, ray_x_indices]
             neus_depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
             # the rendered depth is point-to-point distance and we should convert to depth
             neus_depth = neus_depth / ray_bundle.metadata["directions_norm"]
-            gs_depth = depth[ray_y_indices, ray_x_indices].detach()
+            gs_depth = depth[ray_y_indices, ray_x_indices]
             neus_normal = self.renderer_normal(
                 semantics=field_outputs[FieldHeadNames.NORMALS], weights=weights
             )
-            gs_normal = normal[ray_y_indices, ray_x_indices].detach()
+            gs_normal = normal[ray_y_indices, ray_x_indices]
 
             return_dict["neus_info"] = (
                 neus_rgb,
@@ -708,16 +782,23 @@ class GSDFModel(NeuSFactoModel):
                 * interlevel_loss(outputs["weights_list"], outputs["ray_samples_list"])
             )
             loss_dict["neus_loss"] = (
-                torch.abs(neus_rgb - gs_rgb).mean()
-                + torch.abs(neus_depth - gs_depth).mean()
+                torch.abs(neus_rgb - gs_rgb.detach()).mean()
+                + torch.abs(neus_depth - gs_depth.detach()).mean()
                 * self.config.mono_depth_loss_mult
-                + cos_similarity_loss(neus_normal, gs_normal).mean()
+                + cos_similarity_loss(neus_normal, gs_normal.detach()).mean()
                 * self.config.mono_normal_loss_mult
             )
             grad_theta = outputs["eik_grad"]
             loss_dict["eikonal_loss"] = (
                 (grad_theta.norm(2, dim=-1) - 1) ** 2
             ).mean() * self.config.eikonal_loss_mult
+            if self.step > self.config.scaffold_gs_pretrain + self.config.warmup_length:
+                loss_dict["gsdf_loss"] = (
+                    torch.abs(neus_depth.detach() - gs_depth).mean()
+                    * self.config.mono_depth_loss_mult
+                    + cos_similarity_loss(neus_normal.detach(), gs_normal).mean()
+                    * self.config.mono_normal_loss_mult
+                )
 
         return loss_dict
 
@@ -1166,8 +1247,8 @@ class GSDFModel(NeuSFactoModel):
 
             anchor_sdf_activated = simple_sdf_activate(anchor_sdf)
             anchor_sdf_activated[~anchor_inside_box] = 1
-            padding_length = self.get_anchor.shape[0] - anchor_sdf_activated.shape[0]
-            padding_ones = torch.ones([padding_length]).to(self.get_anchor.device)
+            padding_length = self.anchor.shape[0] - anchor_sdf_activated.shape[0]
+            padding_ones = torch.ones([padding_length]).to(self.anchor.device)
             padded_anchor_sdf_activated = torch.cat(
                 [anchor_sdf_activated, padding_ones], dim=0
             )

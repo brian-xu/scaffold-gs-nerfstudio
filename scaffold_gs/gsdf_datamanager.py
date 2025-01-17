@@ -57,7 +57,7 @@ class GSDFDataManagerConfig(FullImageDatamanagerConfig):
     """Size of patch to sample from. If > 1, patch-based sampling will be used."""
     pixel_sampler: PixelSamplerConfig = field(default_factory=PixelSamplerConfig)
     """Specifies the pixel sampler used to sample pixels from images."""
-    scaffold_gs_pretrain: int = 15000
+    scaffold_gs_pretrain: int = 15_000
     """How many steps to pretrain the Scaffold-GS model before dual training."""
 
 
