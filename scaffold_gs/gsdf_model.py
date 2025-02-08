@@ -110,6 +110,7 @@ class GSDFModelConfig(NeuSFactoModelConfig):
     success_threshold: float = 0.8
     densify_grad_threshold: float = 0.0002
     scaffold_gs_pretrain: int = 15_000
+    normal_loss_warmup: int = 5000
 
     resolution_schedule: int = 3000
     """training starts at 1/d resolution, every n steps this is doubled"""
@@ -563,8 +564,14 @@ class GSDFModel(NeuSFactoModel):
             Outputs of model. (ie. rendered colors)
         """
         if not isinstance(camera, Cameras):
-            print("Called get_outputs with not a camera")
-            return {}
+            if isinstance(camera, RayBundle):
+                ray_bundle = self.ray_collider(camera)
+                result = super().get_outputs(ray_bundle)
+                result["normals"] = result["normal_vis"]
+                return result
+            else:
+                print("Called get_outputs with not a camera")
+                return {}
 
         # during eval the camera gets clone for each raybundle for some reason
         if camera.shape[0] > 1:
@@ -597,7 +604,7 @@ class GSDFModel(NeuSFactoModel):
             radii,
             scaling,
             opacity,
-            gs_depth_hand,
+            gs_depth,
             gs_normal,
         ) = (
             render_pkg["render"],
@@ -620,7 +627,7 @@ class GSDFModel(NeuSFactoModel):
         rgb = rearrange(render, "c h w -> h w c")
         rgb = torch.clamp(rgb, 0.0, 1.0)
 
-        depth = rearrange(gs_depth_hand, "c h w -> h w c")[..., 0] * 1000
+        depth = rearrange(gs_depth, "c h w -> h w c")[..., 0]
         accumulation = background.new_zeros(*rgb.shape[:2], 1)
         normal = rearrange(gs_normal, "c h w -> h w c")
 
@@ -632,6 +639,7 @@ class GSDFModel(NeuSFactoModel):
             "depth": depth.unsqueeze(-1),  # type: ignore
             "accumulation": accumulation,  # type: ignore
             "background": background,  # type: ignore
+            "scaling": scaling,
         }  # type: ignore
 
         if (
@@ -661,7 +669,7 @@ class GSDFModel(NeuSFactoModel):
             neus_depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
             # the rendered depth is point-to-point distance and we should convert to depth
             neus_depth = neus_depth / ray_bundle.metadata["directions_norm"]
-            gs_depth = depth[ray_y_indices, ray_x_indices]
+            gs_depth = depth[ray_y_indices, ray_x_indices] / 100
             neus_normal = self.renderer_normal(
                 semantics=field_outputs[FieldHeadNames.NORMALS], weights=weights
             )
@@ -769,6 +777,8 @@ class GSDFModel(NeuSFactoModel):
             self.camera_optimizer.get_loss_dict(loss_dict)
 
         if self.step > self.config.scaffold_gs_pretrain:
+            scaling_reg = outputs["scaling"].prod(dim=1).mean()
+            loss_dict["main_loss"] += 0.01 * scaling_reg
             (
                 neus_rgb,
                 gs_rgb,
@@ -781,12 +791,27 @@ class GSDFModel(NeuSFactoModel):
                 self.config.interlevel_loss_mult
                 * interlevel_loss(outputs["weights_list"], outputs["ray_samples_list"])
             )
+            loss_weight = (
+                1 / 10
+                if self.step
+                > self.config.scaffold_gs_pretrain + self.config.warmup_length + 15000
+                else 1
+            )
+            normal_loss_mult = (
+                0
+                if self.step
+                < self.config.scaffold_gs_pretrain + self.config.normal_loss_warmup
+                else 1
+            )
             loss_dict["neus_loss"] = (
                 torch.abs(neus_rgb - gs_rgb.detach()).mean()
                 + torch.abs(neus_depth - gs_depth.detach()).mean()
                 * self.config.mono_depth_loss_mult
+                * loss_weight
                 + cos_similarity_loss(neus_normal, gs_normal.detach()).mean()
                 * self.config.mono_normal_loss_mult
+                * loss_weight
+                * normal_loss_mult
             )
             grad_theta = outputs["eik_grad"]
             loss_dict["eikonal_loss"] = (
@@ -796,8 +821,11 @@ class GSDFModel(NeuSFactoModel):
                 loss_dict["gsdf_loss"] = (
                     torch.abs(neus_depth.detach() - gs_depth).mean()
                     * self.config.mono_depth_loss_mult
+                    * loss_weight
                     + cos_similarity_loss(neus_normal.detach(), gs_normal).mean()
                     * self.config.mono_normal_loss_mult
+                    * loss_weight
+                    * normal_loss_mult
                 )
 
         return loss_dict

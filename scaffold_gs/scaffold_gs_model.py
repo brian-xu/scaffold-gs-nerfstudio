@@ -75,7 +75,7 @@ class ScaffoldGSModelConfig(ModelConfig):
     start_stat: int = 500
     update_from: int = 1500
     update_interval: int = 100
-    update_until: int = 15_000
+    update_until: int = 15000
     warmup_length: int = 500
     # densification config
     min_opacity = 0.005

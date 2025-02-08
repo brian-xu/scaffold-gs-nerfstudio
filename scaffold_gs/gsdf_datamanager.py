@@ -143,6 +143,7 @@ class GSDFDataManager(FullImageDatamanager):
 
     def next_train(self, step: int) -> Tuple[RayBundle, Dict]:
         """Returns the next batch of data from the train dataloader."""
+        # TODO: default return rays
         camera, data = super().next_train(step)
         self.train_count += 1
         if step > self.config.scaffold_gs_pretrain:
