@@ -121,10 +121,10 @@ scaffold_gs = MethodSpecification(
 gsdf = MethodSpecification(
     config=TrainerConfig(
         method_name="gsdf",
-        steps_per_eval_image=100,
-        steps_per_eval_batch=0,
+        steps_per_eval_image=5000,
+        steps_per_eval_batch=5000,
         steps_per_save=2000,
-        steps_per_eval_all_images=1000,
+        steps_per_eval_all_images=1000000,  # set to a very large model so we don't eval with all images
         max_num_iterations=45000,
         mixed_precision=False,
         pipeline=VanillaPipelineConfig(
@@ -140,7 +140,7 @@ gsdf = MethodSpecification(
                     hidden_dim=256,
                     bias=0.5,
                     beta_init=0.8,
-                    use_appearance_embedding=False,
+                    use_appearance_embedding=True,
                 ),
                 mono_depth_loss_mult=0.5,
                 mono_normal_loss_mult=0.01,
@@ -154,7 +154,7 @@ gsdf = MethodSpecification(
                 ),
             },
             "fields": {
-                "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
                 "scheduler": DelayedCosineDecaySchedulerConfig(
                     pretrain_steps=15_000,
                     warm_up_end=500,
@@ -163,7 +163,7 @@ gsdf = MethodSpecification(
                 ),
             },
             "field_background": {
-                "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
                 "scheduler": DelayedCosineDecaySchedulerConfig(
                     pretrain_steps=15_000,
                     warm_up_end=500,

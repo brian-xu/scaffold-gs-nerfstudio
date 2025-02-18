@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from functools import reduce
 from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union, cast
 
+import numpy as np
 import torch
 from einops import rearrange
 from jaxtyping import Shaped
@@ -25,7 +26,7 @@ from nerfstudio.field_components.embedding import Embedding
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.mlp import MLP
 from nerfstudio.model_components.lib_bilagrid import color_correct
-from nerfstudio.model_components.losses import interlevel_loss
+from nerfstudio.model_components.losses import interlevel_loss, monosdf_normal_loss
 from nerfstudio.models.neus_facto import NeuSFactoModel, NeuSFactoModelConfig
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.math import k_nearest_sklearn
@@ -273,7 +274,6 @@ class GSDFModel(NeuSFactoModel):
         else:
             self.background_color = get_color(self.config.background_color)
 
-        # TODO: Add gaussian volumetric sampler
         self.ray_collider = self.collider
         self.collider = None
 
@@ -410,7 +410,6 @@ class GSDFModel(NeuSFactoModel):
                 anchor_sdf = self.field(rays_from_positions(anchor_positions))[
                     FieldHeadNames.SDF
                 ][:, 0]
-                print("success")
             else:
                 xyz_sdf = None
                 anchor_sdf = None
@@ -430,7 +429,51 @@ class GSDFModel(NeuSFactoModel):
     def get_training_callbacks(
         self, training_callback_attributes: TrainingCallbackAttributes
     ) -> List[TrainingCallback]:
-        cbs = super().get_training_callbacks(training_callback_attributes)
+        cbs = []
+        if self.step > self.config.scaffold_gs_pretrain:
+            if self.anneal_end > 0:
+
+                def set_anneal(step):
+                    step -= self.config.scaffold_gs_pretrain
+                    anneal = min([1.0, step / self.anneal_end])
+                    self.field.set_cos_anneal_ratio(anneal)
+
+                cbs.append(
+                    TrainingCallback(
+                        where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                        update_every_num_iters=1,
+                        func=set_anneal,
+                    )
+                )
+            if self.config.use_proposal_weight_anneal:
+                # anneal the weights of the proposal network before doing PDF sampling
+                N = self.config.proposal_weights_anneal_max_num_iters
+
+                def set_anneal(step: int):
+                    # https://arxiv.org/pdf/2111.12077.pdf eq. 18
+                    step -= self.config.scaffold_gs_pretrain
+                    train_frac = np.clip(step / N, 0, 1)
+
+                    def bias(x, b):
+                        return b * x / ((b - 1) * x + 1)
+
+                    anneal = bias(train_frac, self.config.proposal_weights_anneal_slope)
+                    self.proposal_sampler.set_anneal(anneal)
+
+                cbs.append(
+                    TrainingCallback(
+                        where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                        update_every_num_iters=1,
+                        func=set_anneal,
+                    )
+                )
+                cbs.append(
+                    TrainingCallback(
+                        where_to_run=[TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+                        update_every_num_iters=1,
+                        func=self.proposal_sampler.step_cb,
+                    )
+                )
         cbs.append(
             TrainingCallback(
                 [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
@@ -448,7 +491,6 @@ class GSDFModel(NeuSFactoModel):
 
     def sample_and_forward_field(self, ray_bundle: RayBundle) -> Dict[str, Any]:
         """Sample rays using proposal networks and compute the corresponding field outputs."""
-        # TODO: use volumetric sampler
         ray_samples, weights_list, ray_samples_list = self.proposal_sampler(
             ray_bundle, density_fns=self.density_fns
         )
@@ -553,7 +595,6 @@ class GSDFModel(NeuSFactoModel):
         return background
 
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
-        # TODO: do neus-facto stuff
         """Takes in a camera and returns a dictionary of outputs.
 
         Args:
@@ -646,7 +687,7 @@ class GSDFModel(NeuSFactoModel):
             self.step > self.config.scaffold_gs_pretrain
             and "ray_bundle" in camera.metadata
         ):
-            ray_bundle = camera.metadata["ray_bundle"]
+            ray_bundle: RayBundle = camera.metadata["ray_bundle"]
             ray_x_indices = camera.metadata["indices"][:, 2] // camera_scale_fac
             ray_x_indices = torch.clamp(ray_x_indices, min=0, max=W - 1).int()
             ray_y_indices = camera.metadata["indices"][:, 1] // camera_scale_fac
@@ -661,6 +702,7 @@ class GSDFModel(NeuSFactoModel):
             grad_points = field_outputs[FieldHeadNames.GRADIENT]
             ray_samples = samples_and_field_outputs["ray_samples"]
             weights = samples_and_field_outputs["weights"]
+            bg_transmittance = samples_and_field_outputs["bg_transmittance"]
 
             neus_rgb = self.renderer_rgb(
                 rgb=field_outputs[FieldHeadNames.RGB], weights=weights
@@ -674,6 +716,47 @@ class GSDFModel(NeuSFactoModel):
                 semantics=field_outputs[FieldHeadNames.NORMALS], weights=weights
             )
             gs_normal = normal[ray_y_indices, ray_x_indices]
+            neus_accumulation = self.renderer_accumulation(weights=weights)
+            # background model
+            if self.config.background_model != "none":
+                assert isinstance(
+                    self.field_background, torch.nn.Module
+                ), "field_background should be a module"
+                assert ray_bundle.fars is not None, "fars is required in ray_bundle"
+                # sample inversely from far to 1000 and points and forward the bg model
+                ray_bundle.nears = ray_bundle.fars
+                assert ray_bundle.fars is not None
+                ray_bundle.fars = (
+                    torch.ones_like(ray_bundle.fars) * self.config.far_plane_bg
+                )
+
+                ray_samples_bg = self.sampler_bg(ray_bundle)
+                # use the same background model for both density field and occupancy field
+                assert not isinstance(self.field_background, Parameter)
+                field_outputs_bg = self.field_background(ray_samples_bg)
+                weights_bg = ray_samples_bg.get_weights(
+                    field_outputs_bg[FieldHeadNames.DENSITY]
+                )
+
+                rgb_bg = self.renderer_rgb(
+                    rgb=field_outputs_bg[FieldHeadNames.RGB], weights=weights_bg
+                )
+                depth_bg = self.renderer_depth(
+                    weights=weights_bg, ray_samples=ray_samples_bg
+                )
+                accumulation_bg = self.renderer_accumulation(weights=weights_bg)
+
+                # merge background color to foregound color
+                neus_rgb = neus_rgb + bg_transmittance * rgb_bg
+
+                bg_outputs = {
+                    "bg_rgb": rgb_bg,
+                    "bg_accumulation": accumulation_bg,
+                    "bg_depth": depth_bg,
+                    "bg_weights": weights_bg,
+                }
+            else:
+                bg_outputs = {}
 
             return_dict["neus_info"] = (
                 neus_rgb,
@@ -682,6 +765,8 @@ class GSDFModel(NeuSFactoModel):
                 gs_depth,
                 neus_normal,
                 gs_normal,
+                neus_accumulation,
+                bg_outputs,
             )
             return_dict.update(samples_and_field_outputs)
             return_dict["eik_grad"] = grad_points
@@ -713,7 +798,6 @@ class GSDFModel(NeuSFactoModel):
             return image
 
     def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
-        # TODO: do neus-facto stuff
         """Compute and returns metrics.
 
         Args:
@@ -739,7 +823,6 @@ class GSDFModel(NeuSFactoModel):
     def get_loss_dict(
         self, outputs, batch, metrics_dict=None
     ) -> Dict[str, torch.Tensor]:
-        # TODO: do neus-facto stuff
         """Computes and returns the losses dict.
 
         Args:
@@ -786,6 +869,8 @@ class GSDFModel(NeuSFactoModel):
                 gs_depth,
                 neus_normal,
                 gs_normal,
+                neus_accumulation,
+                bg_outputs,
             ) = outputs["neus_info"]
             loss_dict["interlevel_loss"] = (
                 self.config.interlevel_loss_mult
@@ -803,12 +888,22 @@ class GSDFModel(NeuSFactoModel):
                 < self.config.scaffold_gs_pretrain + self.config.normal_loss_warmup
                 else 1
             )
+            pred_image, image = self.renderer_rgb.blend_background_for_loss_computation(
+                pred_image=neus_rgb,
+                pred_accumulation=neus_accumulation,
+                gt_image=gs_rgb.detach(),
+            )
+            mask = torch.ones_like(gs_depth).reshape(1, 32, -1).bool()
             loss_dict["neus_loss"] = (
-                torch.abs(neus_rgb - gs_rgb.detach()).mean()
-                + torch.abs(neus_depth - gs_depth.detach()).mean()
+                self.rgb_loss(image, pred_image)
+                + self.depth_loss(
+                    neus_depth.reshape(1, 32, -1),
+                    (gs_depth * 50 + 0.5).reshape(1, 32, -1),
+                    mask,
+                )
                 * self.config.mono_depth_loss_mult
                 * loss_weight
-                + cos_similarity_loss(neus_normal, gs_normal.detach()).mean()
+                + monosdf_normal_loss(neus_normal, gs_normal.detach())
                 * self.config.mono_normal_loss_mult
                 * loss_weight
                 * normal_loss_mult
@@ -848,7 +943,6 @@ class GSDFModel(NeuSFactoModel):
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
-        # TODO: do neus-facto stuff
         """Writes the test image outputs.
 
         Args:
