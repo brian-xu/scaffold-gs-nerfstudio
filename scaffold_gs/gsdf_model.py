@@ -1,7 +1,19 @@
 from dataclasses import dataclass, field
 from functools import reduce
-from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union, cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+    cast,
+)
 
+import nerfacc
 import numpy as np
 import torch
 from einops import rearrange
@@ -26,8 +38,9 @@ from nerfstudio.field_components.embedding import Embedding
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.mlp import MLP
 from nerfstudio.model_components.lib_bilagrid import color_correct
-from nerfstudio.model_components.losses import interlevel_loss, monosdf_normal_loss
-from nerfstudio.models.neus_facto import NeuSFactoModel, NeuSFactoModelConfig
+from nerfstudio.model_components.losses import monosdf_normal_loss
+from nerfstudio.model_components.ray_samplers import NeuSSampler, Sampler
+from nerfstudio.models.neus import NeuSModel, NeuSModelConfig
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.math import k_nearest_sklearn
 
@@ -83,8 +96,200 @@ def inverse_sigmoid(x):
     return torch.log(x / (1 - x))
 
 
+"""NeusAcc code taken from sdfstudio"""
+
+
+class NeuSAccSampler(Sampler):
+    """Voxel surface guided sampler in NeuralReconW."""
+
+    def __init__(
+        self,
+        aabb,
+        neus_sampler: NeuSSampler = None,
+        resolution: int = 128,
+        num_samples: int = 8,
+        num_samples_importance: int = 16,
+        num_samples_boundary: int = 10,
+        steps_warpup: int = 2000,
+        steps_per_grid_update: int = 1000,
+        local_rank: int = 0,
+        single_jitter: bool = False,
+    ) -> None:
+        super().__init__()
+        self.aabb = aabb
+        self.resolution = resolution
+        self.num_samples = num_samples
+        self.num_samples_importance = num_samples_importance
+        self.num_samples_boundary = num_samples_boundary
+        self.single_jitter = single_jitter
+        self.steps_warpup = steps_warpup
+        self.steps_per_grid_update = steps_per_grid_update
+        self.local_rank = local_rank
+        self.step_size = 0.01 / 5.0
+        self.alpha_thres = 0.001
+
+        # only supports cubic bbox for now
+        assert aabb[0, 0] == aabb[0, 1] and aabb[0, 0] == aabb[0, 2]
+        assert aabb[1, 0] == aabb[1, 1] and aabb[1, 0] == aabb[1, 2]
+        self.grid_size = self.resolution
+        self.voxel_size = (aabb[1, 0] - aabb[0, 0]) / self.grid_size
+
+        # neus_sampler at the begining of training
+        self.neus_sampler = neus_sampler
+
+        self.grid = nerfacc.OccGridEstimator(
+            aabb.reshape(-1), resolution=self.resolution
+        )
+        self.grid.binaries[:] = True
+
+        self.register_buffer(
+            "_binary",
+            torch.ones(
+                (self.grid_size, self.grid_size, self.grid_size), dtype=torch.bool
+            ),
+        )
+        self.register_buffer("_update_counter", torch.zeros(1, dtype=torch.int32))
+
+        self.init_grid_coordinate()
+
+    def init_grid_coordinate(self):
+        # coarse grid coordinates
+        aabb = self.aabb
+        offset_x = torch.linspace(
+            aabb[0, 0] + self.voxel_size / 2.0,
+            aabb[1, 0] - self.voxel_size / 2.0,
+            self.grid_size,
+        )
+        offset_y = torch.linspace(
+            aabb[0, 1] + self.voxel_size / 2.0,
+            aabb[1, 1] - self.voxel_size / 2.0,
+            self.grid_size,
+        )
+        offset_z = torch.linspace(
+            aabb[0, 2] + self.voxel_size / 2.0,
+            aabb[1, 2] - self.voxel_size / 2.0,
+            self.grid_size,
+        )
+        x, y, z = torch.meshgrid(offset_x, offset_y, offset_z, indexing="ij")
+        cube_coordinate = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
+
+        self.register_buffer("cube_coordinate", cube_coordinate)
+
+    def update_step_size(self, step, inv_s=None):
+        assert inv_s is not None
+        inv_s = inv_s().item()
+        self.step_size = 14.0 / inv_s / 16
+
+    @torch.no_grad()
+    def update_binary_grid(self, step, sdf_fn=None, inv_s=None):
+        assert sdf_fn is not None
+        assert inv_s is not None
+
+        if step >= self.steps_warpup and step % self.steps_per_grid_update == 0:
+
+            mask = self._binary.reshape(-1)
+            # TODO voxels can't be recovered once it is pruned
+            occupied_voxel = self.cube_coordinate[mask.reshape(-1)]
+
+            # save_points("occupied_voxel.ply", occupied_voxel.cpu().numpy())
+
+            def evaluate(points):
+                z = []
+                for _, pnts in enumerate(torch.split(points, 100000, dim=0)):
+                    z.append(sdf_fn(pnts))
+                z = torch.cat(z, axis=0)
+                return z
+
+            sdf = evaluate(occupied_voxel)
+
+            # sdf_mask = sdf.abs() <= 0.04
+
+            # use maximum bound for sdf value
+            bound = self.voxel_size * (3**0.5) / 2.0
+            sdf = sdf.abs()
+            sdf = torch.maximum(sdf - bound, torch.zeros_like(sdf))
+
+            estimated_next_sdf = sdf - self.step_size * 0.5
+            estimated_prev_sdf = sdf + self.step_size * 0.5
+            inv_s = inv_s()
+            prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
+            next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
+
+            p = prev_cdf - next_cdf
+            c = prev_cdf
+
+            alpha = ((p + 1e-5) / (c + 1e-5)).clip(0.0, 1.0)
+            sdf_mask = alpha > self.alpha_thres
+
+            mask[mask.reshape(-1).clone()] = sdf_mask
+
+            self._binary = mask.reshape([self.grid_size] * 3).contiguous()
+
+            # save_points("voxel_valid.ply", self.cube_coordinate[self._binary.reshape(-1)].cpu().numpy())
+
+            # TODO do we need dilation
+            # F.max_pool3d(M.float(), kernel_size=3, padding=1, stride=1).bool()
+            # save_points("voxel_valid_dilated.ply", self.cube_coordinate[self._binary.reshape(-1)].cpu().numpy())
+            self._update_counter += 1
+
+    def create_ray_samples_from_ray_indices(
+        self, ray_bundle: RayBundle, ray_indices, t_starts, t_ends
+    ):
+        rays_o = ray_bundle.origins[ray_indices]
+        rays_d = ray_bundle.directions[ray_indices]
+        camera_indices = ray_bundle.camera_indices[ray_indices]
+        deltas = t_ends - t_starts
+        frustums = Frustums(
+            origins=rays_o,  # [..., 1, 3]
+            directions=rays_d,  # [..., 1, 3]
+            starts=t_starts,  # [..., num_samples, 1]
+            ends=t_ends,  # [..., num_samples, 1]
+            pixel_area=torch.ones_like(t_starts),  # [..., 1, 1]
+        )
+
+        ray_samples = RaySamples(
+            frustums=frustums,
+            camera_indices=camera_indices,  # [..., 1, 1]
+            deltas=deltas,  # [..., num_samples, 1]
+        )
+        return ray_samples
+
+    @torch.no_grad()
+    def generate_ray_samples(
+        self,
+        ray_bundle: Optional[RayBundle] = None,
+        sdf_fn: Optional[Callable] = None,
+        alpha_fn: Optional[Callable] = None,
+    ) -> Union[Tuple[RaySamples, torch.Tensor], RaySamples]:
+        assert ray_bundle is not None
+        assert sdf_fn is not None
+
+        # sampler with original neus Sampler?
+        if self._update_counter.item() <= 0:
+            return self.neus_sampler(ray_bundle, sdf_fn=sdf_fn)
+
+        assert alpha_fn is not None
+
+        # sampling from occupancy grids
+        ray_indices, t_starts, t_ends = self.grid.sampling(
+            ray_bundle.origins.contiguous(),
+            ray_bundle.directions.contiguous(),
+            t_min=ray_bundle.nears[:, 0].contiguous(),
+            t_max=ray_bundle.fars[:, 0].contiguous(),
+            render_step_size=self.step_size,  # TODO stepsize based on inv_s value?
+        )
+
+        # create ray_samples with the intersection
+        ray_indices = ray_indices.long()
+        ray_samples = self.create_ray_samples_from_ray_indices(
+            ray_bundle, ray_indices, t_starts.unsqueeze(1), t_ends.unsqueeze(1)
+        )
+
+        return ray_samples, ray_indices
+
+
 @dataclass
-class GSDFModelConfig(NeuSFactoModelConfig):
+class GSDFModelConfig(NeuSModelConfig):
     """GSDF Model Config"""
 
     _target: Type = field(default_factory=lambda: GSDFModel)
@@ -110,7 +315,7 @@ class GSDFModelConfig(NeuSFactoModelConfig):
     min_opacity: float = 0.005
     success_threshold: float = 0.8
     densify_grad_threshold: float = 0.0002
-    scaffold_gs_pretrain: int = 15_000
+    scaffold_gs_pretrain: int = 100.0
     normal_loss_warmup: int = 5000
 
     resolution_schedule: int = 3000
@@ -139,7 +344,7 @@ class GSDFModelConfig(NeuSFactoModelConfig):
     """If True, apply color correction to the rendered images before computing the metrics."""
 
 
-class GSDFModel(NeuSFactoModel):
+class GSDFModel(NeuSModel):
     """Nerfstudio implementation of GSDF
 
     Args:
@@ -276,6 +481,13 @@ class GSDFModel(NeuSFactoModel):
 
         self.ray_collider = self.collider
         self.collider = None
+
+        self.sampler = NeuSAccSampler(
+            aabb=self.scene_box.aabb,
+            neus_sampler=self.sampler,
+            steps_warpup=1,
+            steps_per_grid_update=100,
+        )
 
     @property
     def num_points(self):
@@ -430,50 +642,42 @@ class GSDFModel(NeuSFactoModel):
         self, training_callback_attributes: TrainingCallbackAttributes
     ) -> List[TrainingCallback]:
         cbs = []
-        if self.step > self.config.scaffold_gs_pretrain:
-            if self.anneal_end > 0:
+        if self.anneal_end > 0:
 
-                def set_anneal(step):
-                    step -= self.config.scaffold_gs_pretrain
-                    anneal = min([1.0, step / self.anneal_end])
-                    self.field.set_cos_anneal_ratio(anneal)
-
-                cbs.append(
-                    TrainingCallback(
-                        where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
-                        update_every_num_iters=1,
-                        func=set_anneal,
-                    )
+            def set_anneal(step):
+                anneal = min(
+                    [
+                        1.0,
+                        (step - self.config.scaffold_gs_pretrain) / self.anneal_end,
+                    ]
                 )
-            if self.config.use_proposal_weight_anneal:
-                # anneal the weights of the proposal network before doing PDF sampling
-                N = self.config.proposal_weights_anneal_max_num_iters
+                self.field.set_cos_anneal_ratio(anneal)
 
-                def set_anneal(step: int):
-                    # https://arxiv.org/pdf/2111.12077.pdf eq. 18
-                    step -= self.config.scaffold_gs_pretrain
-                    train_frac = np.clip(step / N, 0, 1)
-
-                    def bias(x, b):
-                        return b * x / ((b - 1) * x + 1)
-
-                    anneal = bias(train_frac, self.config.proposal_weights_anneal_slope)
-                    self.proposal_sampler.set_anneal(anneal)
-
-                cbs.append(
-                    TrainingCallback(
-                        where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
-                        update_every_num_iters=1,
-                        func=set_anneal,
-                    )
+            cbs.append(
+                TrainingCallback(
+                    where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                    update_every_num_iters=1,
+                    func=set_anneal,
                 )
-                cbs.append(
-                    TrainingCallback(
-                        where_to_run=[TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
-                        update_every_num_iters=1,
-                        func=self.proposal_sampler.step_cb,
-                    )
-                )
+            )
+        sdf_fn = lambda x: self.field.forward_geonetwork(x)[:, 0].contiguous()
+        inv_s = self.field.deviation_network.get_variance
+        cbs.append(
+            TrainingCallback(
+                where_to_run=[TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+                update_every_num_iters=1,
+                func=self.sampler.update_binary_grid,
+                kwargs={"sdf_fn": sdf_fn, "inv_s": inv_s},
+            )
+        )
+        cbs.append(
+            TrainingCallback(
+                where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                update_every_num_iters=1,
+                func=self.sampler.update_step_size,
+                kwargs={"inv_s": inv_s},
+            )
+        )
         cbs.append(
             TrainingCallback(
                 [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
@@ -488,31 +692,6 @@ class GSDFModel(NeuSFactoModel):
             )
         )
         return cbs
-
-    def sample_and_forward_field(self, ray_bundle: RayBundle) -> Dict[str, Any]:
-        """Sample rays using proposal networks and compute the corresponding field outputs."""
-        ray_samples, weights_list, ray_samples_list = self.proposal_sampler(
-            ray_bundle, density_fns=self.density_fns
-        )
-
-        field_outputs = self.field(ray_samples, return_alphas=True)
-        weights, transmittance = ray_samples.get_weights_and_transmittance_from_alphas(
-            field_outputs[FieldHeadNames.ALPHA]
-        )
-        bg_transmittance = transmittance[:, -1, :]
-
-        weights_list.append(weights)
-        ray_samples_list.append(ray_samples)
-
-        samples_and_field_outputs = {
-            "ray_samples": ray_samples,
-            "field_outputs": field_outputs,
-            "weights": weights,
-            "bg_transmittance": bg_transmittance,
-            "weights_list": weights_list,
-            "ray_samples_list": ray_samples_list,
-        }
-        return samples_and_field_outputs
 
     def step_cb(self, optimizers: Optimizers, step):
         self.step = step
@@ -692,84 +871,74 @@ class GSDFModel(NeuSFactoModel):
             ray_x_indices = torch.clamp(ray_x_indices, min=0, max=W - 1).int()
             ray_y_indices = camera.metadata["indices"][:, 1] // camera_scale_fac
             ray_y_indices = torch.clamp(ray_y_indices, min=0, max=H - 1).int()
-            samples_and_field_outputs = self.sample_and_forward_field(
-                ray_bundle=self.ray_collider(ray_bundle)
-            )
-            field_outputs: Dict[FieldHeadNames, torch.Tensor] = cast(
-                Dict[FieldHeadNames, torch.Tensor],
-                samples_and_field_outputs["field_outputs"],
-            )
-            grad_points = field_outputs[FieldHeadNames.GRADIENT]
-            ray_samples = samples_and_field_outputs["ray_samples"]
-            weights = samples_and_field_outputs["weights"]
-            bg_transmittance = samples_and_field_outputs["bg_transmittance"]
-
-            neus_rgb = self.renderer_rgb(
-                rgb=field_outputs[FieldHeadNames.RGB], weights=weights
-            )
             gs_rgb = rgb[ray_y_indices, ray_x_indices]
-            neus_depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
-            # the rendered depth is point-to-point distance and we should convert to depth
-            neus_depth = neus_depth / ray_bundle.metadata["directions_norm"]
             gs_depth = depth[ray_y_indices, ray_x_indices] / 100
-            neus_normal = self.renderer_normal(
-                semantics=field_outputs[FieldHeadNames.NORMALS], weights=weights
-            )
             gs_normal = normal[ray_y_indices, ray_x_indices]
-            neus_accumulation = self.renderer_accumulation(weights=weights)
-            # background model
-            if self.config.background_model != "none":
-                assert isinstance(
-                    self.field_background, torch.nn.Module
-                ), "field_background should be a module"
-                assert ray_bundle.fars is not None, "fars is required in ray_bundle"
-                # sample inversely from far to 1000 and points and forward the bg model
-                ray_bundle.nears = ray_bundle.fars
-                assert ray_bundle.fars is not None
-                ray_bundle.fars = (
-                    torch.ones_like(ray_bundle.fars) * self.config.far_plane_bg
+            if self.sampler._update_counter.item() <= 0:
+                sdf_outputs = super().get_outputs(self.ray_collider(ray_bundle))
+                return_dict["neus_info"] = (
+                    sdf_outputs["rgb"],
+                    gs_rgb,
+                    sdf_outputs["depth"],
+                    gs_depth,
+                    sdf_outputs["normal"],
+                    gs_normal,
+                    sdf_outputs["accumulation"],
                 )
+                return_dict["eik_grad"] = sdf_outputs["eik_grad"]
+                return return_dict
 
-                ray_samples_bg = self.sampler_bg(ray_bundle)
-                # use the same background model for both density field and occupancy field
-                assert not isinstance(self.field_background, Parameter)
-                field_outputs_bg = self.field_background(ray_samples_bg)
-                weights_bg = ray_samples_bg.get_weights(
-                    field_outputs_bg[FieldHeadNames.DENSITY]
-                )
-
-                rgb_bg = self.renderer_rgb(
-                    rgb=field_outputs_bg[FieldHeadNames.RGB], weights=weights_bg
-                )
-                depth_bg = self.renderer_depth(
-                    weights=weights_bg, ray_samples=ray_samples_bg
-                )
-                accumulation_bg = self.renderer_accumulation(weights=weights_bg)
-
-                # merge background color to foregound color
-                neus_rgb = neus_rgb + bg_transmittance * rgb_bg
-
-                bg_outputs = {
-                    "bg_rgb": rgb_bg,
-                    "bg_accumulation": accumulation_bg,
-                    "bg_depth": depth_bg,
-                    "bg_weights": weights_bg,
-                }
-            else:
-                bg_outputs = {}
-
-            return_dict["neus_info"] = (
-                neus_rgb,
-                gs_rgb,
-                neus_depth,
-                gs_depth,
-                neus_normal,
-                gs_normal,
-                neus_accumulation,
-                bg_outputs,
+            ray_samples, ray_indices = self.sampler(
+                self.ray_collider(ray_bundle),
+                sdf_fn=self.field.get_sdf,
+                alpha_fn=self.field.get_alpha,
             )
-            return_dict.update(samples_and_field_outputs)
-            return_dict["eik_grad"] = grad_points
+            if ray_samples.shape[0] > 0:
+                field_outputs = self.field(ray_samples, return_alphas=True)
+                n_rays = ray_bundle.shape[0]
+                weights = nerfacc.render_weight_from_alpha(
+                    field_outputs[FieldHeadNames.ALPHA],
+                    ray_indices=ray_indices,
+                    n_rays=n_rays,
+                )
+
+                neus_rgb = nerfacc.accumulate_along_rays(
+                    weights,
+                    ray_indices,
+                    values=field_outputs[FieldHeadNames.RGB],
+                    n_rays=n_rays,
+                )
+                neus_depth = nerfacc.accumulate_along_rays(
+                    weights,
+                    ray_indices,
+                    values=(ray_samples.frustums.starts + ray_samples.frustums.ends)
+                    / 2,
+                    n_rays=n_rays,
+                )
+                # the rendered depth is point-to-point distance and we should convert to depth
+                neus_depth = neus_depth / ray_bundle.metadata["directions_norm"]
+                neus_normal = nerfacc.accumulate_along_rays(
+                    weights,
+                    ray_indices,
+                    values=field_outputs[FieldHeadNames.NORMAL],
+                    n_rays=n_rays,
+                )
+                neus_accumulation = nerfacc.accumulate_along_rays(
+                    weights, ray_indices, values=None, n_rays=n_rays
+                )
+
+                return_dict["neus_info"] = (
+                    neus_rgb,
+                    gs_rgb,
+                    neus_depth,
+                    gs_depth,
+                    neus_normal,
+                    gs_normal,
+                    neus_accumulation,
+                )
+
+                grad_points = field_outputs[FieldHeadNames.GRADIENT]
+                return_dict["eik_grad"] = grad_points
 
         return return_dict
 
@@ -859,7 +1028,7 @@ class GSDFModel(NeuSFactoModel):
             # Add loss from camera optimizer
             self.camera_optimizer.get_loss_dict(loss_dict)
 
-        if self.step > self.config.scaffold_gs_pretrain:
+        if self.step > self.config.scaffold_gs_pretrain and "neus_info" in outputs:
             scaling_reg = outputs["scaling"].prod(dim=1).mean()
             loss_dict["main_loss"] += 0.01 * scaling_reg
             (
@@ -870,12 +1039,7 @@ class GSDFModel(NeuSFactoModel):
                 neus_normal,
                 gs_normal,
                 neus_accumulation,
-                bg_outputs,
             ) = outputs["neus_info"]
-            loss_dict["interlevel_loss"] = (
-                self.config.interlevel_loss_mult
-                * interlevel_loss(outputs["weights_list"], outputs["ray_samples_list"])
-            )
             loss_weight = (
                 1 / 10
                 if self.step
@@ -908,10 +1072,11 @@ class GSDFModel(NeuSFactoModel):
                 * loss_weight
                 * normal_loss_mult
             )
-            grad_theta = outputs["eik_grad"]
-            loss_dict["eikonal_loss"] = (
-                (grad_theta.norm(2, dim=-1) - 1) ** 2
-            ).mean() * self.config.eikonal_loss_mult
+            if self.training:
+                grad_theta = outputs["eik_grad"]
+                loss_dict["eikonal_loss"] = (
+                    (grad_theta.norm(2, dim=-1) - 1) ** 2
+                ).mean() * self.config.eikonal_loss_mult
             if self.step > self.config.scaffold_gs_pretrain + self.config.warmup_length:
                 loss_dict["gsdf_loss"] = (
                     torch.abs(neus_depth.detach() - gs_depth).mean()

@@ -156,7 +156,7 @@ gsdf = MethodSpecification(
             "fields": {
                 "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
                 "scheduler": DelayedCosineDecaySchedulerConfig(
-                    pretrain_steps=15_000,
+                    pretrain_steps=100.0,
                     warm_up_end=500,
                     learning_rate_alpha=0.05,
                     max_steps=20000,
@@ -165,7 +165,7 @@ gsdf = MethodSpecification(
             "field_background": {
                 "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
                 "scheduler": DelayedCosineDecaySchedulerConfig(
-                    pretrain_steps=15_000,
+                    pretrain_steps=100.0,
                     warm_up_end=500,
                     learning_rate_alpha=0.05,
                     max_steps=20000,
