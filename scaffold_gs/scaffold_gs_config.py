@@ -123,7 +123,7 @@ gsdf = MethodSpecification(
         method_name="gsdf",
         steps_per_eval_image=5000,
         steps_per_eval_batch=5000,
-        steps_per_save=2000,
+        steps_per_save=500,
         steps_per_eval_all_images=1000000,  # set to a very large model so we don't eval with all images
         max_num_iterations=45000,
         mixed_precision=False,
@@ -147,12 +147,6 @@ gsdf = MethodSpecification(
             ),
         ),
         optimizers={
-            "proposal_networks": {
-                "optimizer": AdamOptimizerConfig(lr=3e-2, eps=1e-15),
-                "scheduler": MultiStepSchedulerConfig(
-                    max_steps=20001, milestones=(15000, 25000, 30000, 33000)
-                ),
-            },
             "fields": {
                 "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
                 "scheduler": DelayedCosineDecaySchedulerConfig(

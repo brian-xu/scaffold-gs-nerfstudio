@@ -155,7 +155,7 @@ class GSDFDataManager(FullImageDatamanager):
             ray_indices = batch["indices"]
             ray_bundle = self.train_ray_generator(ray_indices)
             data["image"] = data["image"].squeeze(0)
-            camera.metadata["raycast_image"] = batch["image"]
+            data["raycast_image"] = batch["image"]
             camera.metadata["indices"] = batch["indices"]
             camera.metadata["ray_bundle"] = ray_bundle
         return camera, data
@@ -173,7 +173,7 @@ class GSDFDataManager(FullImageDatamanager):
             ray_indices = batch["indices"]
             ray_bundle = self.eval_ray_generator(ray_indices)
             data["image"] = data["image"].squeeze(0)
-            camera.metadata["raycast_image"] = batch["image"]
+            data["raycast_image"] = batch["image"]
             camera.metadata["indices"] = batch["indices"]
             camera.metadata["ray_bundle"] = ray_bundle
         return camera, data
