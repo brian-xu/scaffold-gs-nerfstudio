@@ -2,9 +2,7 @@ from dataclasses import dataclass, field
 from functools import reduce
 from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union, cast
 
-import numpy as np
 import torch
-import torchvision
 from einops import rearrange
 from jaxtyping import Float, Shaped
 from pytorch_msssim import SSIM
@@ -13,6 +11,8 @@ from scaffold_gs.scaffold_gs_renderer import prefilter_voxel, scaffold_gs_render
 from torch import Tensor
 from torch.nn import Parameter
 from torch_scatter import scatter_max
+from torchmetrics.image import PeakSignalNoiseRatio
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
@@ -28,7 +28,7 @@ from nerfstudio.field_components.embedding import Embedding
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.mlp import MLP
 from nerfstudio.model_components.lib_bilagrid import color_correct
-from nerfstudio.model_components.losses import interlevel_loss, monosdf_normal_loss
+from nerfstudio.model_components.losses import monosdf_normal_loss
 from nerfstudio.models.neus import NeuSModel, NeuSModelConfig
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.math import k_nearest_sklearn
@@ -262,9 +262,6 @@ class GSDFModel(NeuSModel):
         )
 
         # metrics
-        from torchmetrics.image import PeakSignalNoiseRatio
-        from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
         self.ssim = SSIM(data_range=1.0, size_average=True, channel=3)
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
@@ -470,19 +467,21 @@ class GSDFModel(NeuSModel):
     def sample_and_forward_field(
         self,
         ray_bundle: RayBundle,
-        gs_depth: Optional[Float[Tensor, "*batch num_samples 1"]] = None,
+        metric_depth: Optional[Float[Tensor, "*batch num_samples 1"]] = None,
     ) -> Dict[str, Any]:
         """Sample rays using GS depth and compute the corresponding field outputs."""
-        if gs_depth is None:
-            gs_depth = self.field.get_sdf(rays_from_positions(ray_bundle.origins))
+        if metric_depth is None:
+            metric_depth = self.field.get_sdf(rays_from_positions(ray_bundle.origins))
         else:
-            gs_depth = gs_depth.unsqueeze(-1)
-        gs_depth.detach()
-        gs_depth_positions = ray_bundle.origins + ray_bundle.directions * gs_depth
+            metric_depth = metric_depth.unsqueeze(-1)
+        metric_depth = metric_depth.detach()
+        metric_depth_positions = (
+            ray_bundle.origins + ray_bundle.directions * metric_depth
+        )
         # Calculate the sdf values in the depth points
-        sdf_depth = self.field.get_sdf(rays_from_positions(gs_depth_positions))
+        sdf_depth = self.field.get_sdf(rays_from_positions(metric_depth_positions))
         ray_samples = self.depth_sampler.generate_ray_samples(
-            ray_bundle, gs_depth=gs_depth, sdf_depth=sdf_depth
+            ray_bundle, gs_depth=metric_depth, sdf_depth=sdf_depth
         )
 
         field_outputs = self.field(ray_samples, return_alphas=True)
@@ -579,6 +578,21 @@ class GSDFModel(NeuSModel):
             raise ValueError(f"Unknown background color {self.config.background_color}")
         return background
 
+    @torch.no_grad()
+    def get_outputs_for_camera(
+        self, camera: Cameras, obb_box: Optional[OrientedBox] = None
+    ) -> Dict[str, torch.Tensor]:
+        """Takes in a camera, generates the raybundle, and computes the output of the model.
+        Overridden for a camera-based gaussian model.
+
+        Args:
+            camera: generates raybundle
+        """
+        assert camera is not None, "must provide camera to gaussian model"
+        self.set_crop(obb_box)
+        outs = self.get_outputs(camera.to(self.device))
+        return outs  # type: ignore
+
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         """Takes in a camera and returns a dictionary of outputs.
 
@@ -651,10 +665,8 @@ class GSDFModel(NeuSModel):
         rgb = rearrange(render, "c h w -> h w c")
         rgb = torch.clamp(rgb, 0.0, 1.0)
 
-        depth = torchvision.transforms.Normalize(mean=0.5, std=0.5)(
-            rearrange(gs_depth, "c h w -> h w c")[..., 0].unsqueeze(0).unsqueeze(0)
-        ).squeeze()
-        accumulation = background.new_zeros(*rgb.shape[:2], 1)
+        depth = rearrange(gs_depth, "c h w -> h w c")[..., 0]
+        accumulation = depth
         normal = (rearrange(gs_normal, "c h w -> h w c") + 1) / 2
 
         if background.shape[0] == 3 and not self.training:
@@ -664,7 +676,7 @@ class GSDFModel(NeuSModel):
             "rgb": rgb.squeeze(0),  # type: ignore
             "depth": depth.unsqueeze(-1),  # type: ignore
             "normal": normal.squeeze(0),  # type: ignore
-            "accumulation": accumulation,  # type: ignore
+            "accumulation": accumulation.unsqueeze(-1),  # type: ignore
             "background": background,  # type: ignore
             "scaling": scaling,
         }  # type: ignore
@@ -686,11 +698,11 @@ class GSDFModel(NeuSModel):
             ray_x_indices = torch.clamp(ray_x_indices, min=0, max=W - 1).int()
             ray_y_indices = camera.metadata["indices"][:, 1] // camera_scale_fac
             ray_y_indices = torch.clamp(ray_y_indices, min=0, max=H - 1).int()
-            gs_rgb = rgb[ray_y_indices, ray_x_indices]
+            rgb_indices = [ray_y_indices, ray_x_indices]
             gs_depth = depth[ray_y_indices, ray_x_indices]
             gs_normal = normal[ray_y_indices, ray_x_indices]
             samples_and_field_outputs = self.sample_and_forward_field(
-                ray_bundle=self.ray_collider(ray_bundle), gs_depth=gs_depth
+                ray_bundle=self.ray_collider(ray_bundle), metric_depth=gs_depth
             )
             field_outputs: Dict[FieldHeadNames, torch.Tensor] = cast(
                 Dict[FieldHeadNames, torch.Tensor],
@@ -735,32 +747,18 @@ class GSDFModel(NeuSModel):
                 rgb_bg = self.renderer_rgb(
                     rgb=field_outputs_bg[FieldHeadNames.RGB], weights=weights_bg
                 )
-                depth_bg = self.renderer_depth(
-                    weights=weights_bg, ray_samples=ray_samples_bg
-                )
-                accumulation_bg = self.renderer_accumulation(weights=weights_bg)
 
                 # merge background color to foregound color
                 neus_rgb = neus_rgb + bg_transmittance * rgb_bg
 
-                bg_outputs = {
-                    "bg_rgb": rgb_bg,
-                    "bg_accumulation": accumulation_bg,
-                    "bg_depth": depth_bg,
-                    "bg_weights": weights_bg,
-                }
-            else:
-                bg_outputs = {}
-
             return_dict["neus_info"] = (
                 neus_rgb,
-                gs_rgb,
+                rgb_indices,
                 neus_depth,
                 gs_depth,
                 neus_normal,
                 gs_normal,
                 neus_accumulation,
-                bg_outputs,
             )
             return_dict["eik_grad"] = grad_points
 
@@ -810,6 +808,13 @@ class GSDFModel(NeuSModel):
 
         metrics_dict["gaussian_count"] = self.num_points
 
+        if self.training and self.step > self.config.scaffold_gs_pretrain:
+            # training statics
+            metrics_dict["s_val"] = self.field.deviation_network.get_variance().item()
+            metrics_dict["inv_s"] = (
+                1.0 / self.field.deviation_network.get_variance().item()
+            )
+
         self.camera_optimizer.get_metrics_dict(metrics_dict)
         return metrics_dict
 
@@ -857,14 +862,14 @@ class GSDFModel(NeuSModel):
             loss_dict["main_loss"] += 0.01 * scaling_reg
             (
                 neus_rgb,
-                gs_rgb,
+                rgb_indices,
                 neus_depth,
                 gs_depth,
                 neus_normal,
                 gs_normal,
                 neus_accumulation,
-                bg_outputs,
             ) = outputs["neus_info"]
+            ray_y_indices, ray_x_indices = rgb_indices
             loss_weight = (
                 1 / 10
                 if self.step
@@ -880,19 +885,21 @@ class GSDFModel(NeuSModel):
             pred_image, image = self.renderer_rgb.blend_background_for_loss_computation(
                 pred_image=neus_rgb,
                 pred_accumulation=neus_accumulation,
-                gt_image=batch["raycast_image"],
+                gt_image=gt_img[ray_y_indices, ray_x_indices],
             )
             mask = torch.ones_like(gs_depth).reshape(1, 32, -1).bool()
-            loss_dict["neus_loss"] = (
-                self.rgb_loss(image, pred_image)
-                + self.depth_loss(
+            loss_dict["neus_loss"] = self.rgb_loss(image, pred_image)
+            loss_dict["neus_depth"] = (
+                self.depth_loss(
                     neus_depth.reshape(1, 32, -1),
-                    (gs_depth * 50 + 0.5).reshape(1, 32, -1),
+                    gs_depth.detach().reshape(1, 32, -1),
                     mask,
                 )
                 * self.config.mono_depth_loss_mult
                 * loss_weight
-                + monosdf_normal_loss(neus_normal, gs_normal.detach())
+            )
+            loss_dict["neus_normal"] = (
+                monosdf_normal_loss(neus_normal, gs_normal.detach())
                 * self.config.mono_normal_loss_mult
                 * loss_weight
                 * normal_loss_mult
@@ -913,21 +920,6 @@ class GSDFModel(NeuSModel):
                 )
 
         return loss_dict
-
-    @torch.no_grad()
-    def get_outputs_for_camera(
-        self, camera: Cameras, obb_box: Optional[OrientedBox] = None
-    ) -> Dict[str, torch.Tensor]:
-        """Takes in a camera, generates the raybundle, and computes the output of the model.
-        Overridden for a camera-based gaussian model.
-
-        Args:
-            camera: generates raybundle
-        """
-        assert camera is not None, "must provide camera to gaussian model"
-        self.set_crop(obb_box)
-        outs = self.get_outputs(camera.to(self.device))
-        return outs  # type: ignore
 
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]

@@ -142,6 +142,8 @@ gsdf = MethodSpecification(
                     beta_init=0.8,
                     use_appearance_embedding=True,
                 ),
+                near_plane=0.05,
+                far_plane=100,
                 mono_depth_loss_mult=0.5,
                 mono_normal_loss_mult=0.01,
             ),
