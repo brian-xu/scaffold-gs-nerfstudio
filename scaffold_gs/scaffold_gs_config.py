@@ -11,10 +11,7 @@ from nerfstudio.data.datamanagers.full_images_datamanager import (
 )
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.engine.optimizers import AdamOptimizerConfig
-from nerfstudio.engine.schedulers import (
-    ExponentialDecaySchedulerConfig,
-    MultiStepSchedulerConfig,
-)
+from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
 from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.fields.sdf_field import SDFFieldConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
@@ -129,8 +126,9 @@ gsdf = MethodSpecification(
         mixed_precision=False,
         pipeline=VanillaPipelineConfig(
             datamanager=GSDFDataManagerConfig(
-                dataparser=NerfstudioDataParserConfig(load_3D_points=True),
-                cache_images_type="uint8",
+                dataparser=NerfstudioDataParserConfig(
+                    load_3D_points=True, center_method="focus"
+                ),
             ),
             model=GSDFModelConfig(
                 sdf_field=SDFFieldConfig(

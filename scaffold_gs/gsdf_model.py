@@ -1,10 +1,11 @@
 from dataclasses import dataclass, field
 from functools import reduce
-from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union, cast
+from typing import Dict, List, Literal, Optional, Tuple, Type, Union, cast
 
 import torch
+import torchvision
 from einops import rearrange
-from jaxtyping import Float, Shaped
+from jaxtyping import Shaped
 from pytorch_msssim import SSIM
 from scaffold_gs.gsdf_depth_sampler import GSDFDepthSampler
 from scaffold_gs.scaffold_gs_renderer import prefilter_voxel, scaffold_gs_render
@@ -275,9 +276,6 @@ class GSDFModel(NeuSModel):
         else:
             self.background_color = get_color(self.config.background_color)
 
-        self.ray_collider = self.collider
-        self.collider = None
-
         self.depth_sampler = GSDFDepthSampler(radius=self.config.radius)
 
     @property
@@ -401,7 +399,7 @@ class GSDFModel(NeuSModel):
                 # calculate the sdf of 3D Gaussians in the frontground.
                 inside_xyz_sdf = self.field.get_sdf(
                     rays_from_positions(inside_positions)
-                )
+                ).detach()
 
                 xyz_sdf[inside_box] = inside_xyz_sdf[:, 0]
                 # calculate the sdf of anchor points in the frontground
@@ -410,9 +408,9 @@ class GSDFModel(NeuSModel):
                     anchor_positions < max_point
                 )
                 anchor_inside_box = anchor_inside_box.all(dim=1)
-                anchor_sdf = self.field.get_sdf(rays_from_positions(anchor_positions))[
-                    :, 0
-                ]
+                anchor_sdf = self.field.get_sdf(
+                    rays_from_positions(anchor_positions)
+                ).detach()[:, 0]
             else:
                 xyz_sdf = None
                 anchor_sdf = None
@@ -438,15 +436,21 @@ class GSDFModel(NeuSModel):
 
             def set_anneal(step):
                 anneal = min(
-                    [1.0, (step - self.config.scaffold_gs_pretrain) / self.anneal_end]
+                    [
+                        1.0,
+                        max(
+                            0,
+                            (step - self.config.scaffold_gs_pretrain) / self.anneal_end,
+                        ),
+                    ]
                 )
                 self.field.set_cos_anneal_ratio(anneal)
 
             cbs.append(
                 TrainingCallback(
                     where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
-                    update_every_num_iters=1,
                     func=set_anneal,
+                    update_every_num_iters=1,
                 )
             )
         cbs.append(
@@ -464,39 +468,37 @@ class GSDFModel(NeuSModel):
         )
         return cbs
 
-    def sample_and_forward_field(
-        self,
-        ray_bundle: RayBundle,
-        metric_depth: Optional[Float[Tensor, "*batch num_samples 1"]] = None,
-    ) -> Dict[str, Any]:
-        """Sample rays using GS depth and compute the corresponding field outputs."""
-        if metric_depth is None:
-            metric_depth = self.field.get_sdf(rays_from_positions(ray_bundle.origins))
-        else:
-            metric_depth = metric_depth.unsqueeze(-1)
-        metric_depth = metric_depth.detach()
-        metric_depth_positions = (
-            ray_bundle.origins + ray_bundle.directions * metric_depth
-        )
-        # Calculate the sdf values in the depth points
-        sdf_depth = self.field.get_sdf(rays_from_positions(metric_depth_positions))
-        ray_samples = self.depth_sampler.generate_ray_samples(
-            ray_bundle, gs_depth=metric_depth, sdf_depth=sdf_depth
-        )
+    # def sample_and_forward_field(
+    #     self,
+    #     ray_bundle: RayBundle,
+    #     metric_depth: Optional[Float[Tensor, "*batch num_samples 1"]] = None,
+    # ) -> Dict[str, Any]:
+    #     """Sample rays using GS depth and compute the corresponding field outputs."""
+    #     if metric_depth is None:
+    #         return super().sample_and_forward_field(ray_bundle)
+    #     metric_depth = metric_depth.unsqueeze(-1).detach()
+    #     metric_depth_positions = (
+    #         ray_bundle.origins + ray_bundle.directions * metric_depth
+    #     )
+    #     # Calculate the sdf values in the depth points
+    #     sdf_depth = self.field.get_sdf(rays_from_positions(metric_depth_positions))
+    #     ray_samples = self.depth_sampler.generate_ray_samples(
+    #         ray_bundle, gs_depth=metric_depth, sdf_depth=sdf_depth
+    #     )
 
-        field_outputs = self.field(ray_samples, return_alphas=True)
-        weights, transmittance = ray_samples.get_weights_and_transmittance_from_alphas(
-            field_outputs[FieldHeadNames.ALPHA]
-        )
-        bg_transmittance = transmittance[:, -1, :]
+    #     field_outputs = self.field(ray_samples, return_alphas=True)
+    #     weights, transmittance = ray_samples.get_weights_and_transmittance_from_alphas(
+    #         field_outputs[FieldHeadNames.ALPHA]
+    #     )
+    #     bg_transmittance = transmittance[:, -1, :]
 
-        samples_and_field_outputs = {
-            "ray_samples": ray_samples,
-            "field_outputs": field_outputs,
-            "weights": weights,
-            "bg_transmittance": bg_transmittance,
-        }
-        return samples_and_field_outputs
+    #     samples_and_field_outputs = {
+    #         "ray_samples": ray_samples,
+    #         "field_outputs": field_outputs,
+    #         "weights": weights,
+    #         "bg_transmittance": bg_transmittance,
+    #     }
+    #     return samples_and_field_outputs
 
     def step_cb(self, optimizers: Optimizers, step):
         self.step = step
@@ -593,7 +595,9 @@ class GSDFModel(NeuSModel):
         outs = self.get_outputs(camera.to(self.device))
         return outs  # type: ignore
 
-    def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
+    def get_outputs(
+        self, ray_bundle: RayBundle
+    ) -> Dict[str, Union[torch.Tensor, List]]:
         """Takes in a camera and returns a dictionary of outputs.
 
         Args:
@@ -603,13 +607,7 @@ class GSDFModel(NeuSModel):
         Returns:
             Outputs of model. (ie. rendered colors)
         """
-        if not isinstance(camera, Cameras):
-            if isinstance(camera, RayBundle):
-                ray_bundle = self.ray_collider(camera)
-                return super().get_outputs(ray_bundle)
-            else:
-                print("Called get_outputs with not a camera")
-                return {}
+        camera = ray_bundle.extra["camera"]
 
         # during eval the camera gets clone for each raybundle for some reason
         if camera.shape[0] > 1:
@@ -665,7 +663,9 @@ class GSDFModel(NeuSModel):
         rgb = rearrange(render, "c h w -> h w c")
         rgb = torch.clamp(rgb, 0.0, 1.0)
 
-        depth = rearrange(gs_depth, "c h w -> h w c")[..., 0]
+        depth = torchvision.transforms.Normalize(mean=0.5, std=0.5)(
+            rearrange(gs_depth, "c h w -> h w c")[..., 0].unsqueeze(0).unsqueeze(0)
+        ).squeeze()
         accumulation = depth
         normal = (rearrange(gs_normal, "c h w -> h w c") + 1) / 2
 
@@ -681,11 +681,8 @@ class GSDFModel(NeuSModel):
             "scaling": scaling,
         }  # type: ignore
 
-        if (
-            self.step > self.config.scaffold_gs_pretrain
-            and "ray_bundle" in camera.metadata
-        ):
-            rot = camera.camera_to_worlds[0, :3, :3]
+        if self.step > self.config.scaffold_gs_pretrain:
+            rot = camera.camera_to_worlds[0, :3, :3].to(self.device)
 
             normal_map = ((gs_normal * 2) - 1).reshape(3, -1)
             normal_map = torch.nn.functional.normalize(normal_map, p=2, dim=0)
@@ -693,16 +690,14 @@ class GSDFModel(NeuSModel):
             normal_map = rot @ normal_map
             normal = normal_map.permute(1, 0).reshape(*gs_normal.shape[1:], 3)
 
-            ray_bundle: RayBundle = camera.metadata["ray_bundle"]
-            ray_x_indices = camera.metadata["indices"][:, 2] // camera_scale_fac
+            ray_x_indices = ray_bundle.extra["indices"][:, 2] // camera_scale_fac
             ray_x_indices = torch.clamp(ray_x_indices, min=0, max=W - 1).int()
-            ray_y_indices = camera.metadata["indices"][:, 1] // camera_scale_fac
+            ray_y_indices = ray_bundle.extra["indices"][:, 1] // camera_scale_fac
             ray_y_indices = torch.clamp(ray_y_indices, min=0, max=H - 1).int()
-            rgb_indices = [ray_y_indices, ray_x_indices]
             gs_depth = depth[ray_y_indices, ray_x_indices]
             gs_normal = normal[ray_y_indices, ray_x_indices]
             samples_and_field_outputs = self.sample_and_forward_field(
-                ray_bundle=self.ray_collider(ray_bundle), metric_depth=gs_depth
+                ray_bundle=ray_bundle  # , metric_depth=gs_depth
             )
             field_outputs: Dict[FieldHeadNames, torch.Tensor] = cast(
                 Dict[FieldHeadNames, torch.Tensor],
@@ -753,7 +748,6 @@ class GSDFModel(NeuSModel):
 
             return_dict["neus_info"] = (
                 neus_rgb,
-                rgb_indices,
                 neus_depth,
                 gs_depth,
                 neus_normal,
@@ -796,7 +790,7 @@ class GSDFModel(NeuSModel):
             batch: ground truth batch corresponding to outputs
         """
         gt_rgb = self.composite_with_background(
-            self.get_gt_img(batch["image"]), outputs["background"]
+            self.get_gt_img(batch["full_image"]), outputs["background"]
         )
         metrics_dict = {}
         predicted_rgb = outputs["rgb"]
@@ -829,7 +823,7 @@ class GSDFModel(NeuSModel):
             metrics_dict: dictionary of metrics, some of which we can use for loss
         """
         gt_img = self.composite_with_background(
-            self.get_gt_img(batch["image"]), outputs["background"]
+            self.get_gt_img(batch["full_image"]), outputs["background"]
         )
         pred_img = outputs["rgb"]
 
@@ -862,14 +856,12 @@ class GSDFModel(NeuSModel):
             loss_dict["main_loss"] += 0.01 * scaling_reg
             (
                 neus_rgb,
-                rgb_indices,
                 neus_depth,
                 gs_depth,
                 neus_normal,
                 gs_normal,
                 neus_accumulation,
             ) = outputs["neus_info"]
-            ray_y_indices, ray_x_indices = rgb_indices
             loss_weight = (
                 1 / 10
                 if self.step
@@ -885,35 +877,39 @@ class GSDFModel(NeuSModel):
             pred_image, image = self.renderer_rgb.blend_background_for_loss_computation(
                 pred_image=neus_rgb,
                 pred_accumulation=neus_accumulation,
-                gt_image=gt_img[ray_y_indices, ray_x_indices],
+                gt_image=batch["image"].to(self.device),
             )
-            mask = torch.ones_like(gs_depth).reshape(1, 32, -1).bool()
             loss_dict["neus_loss"] = self.rgb_loss(image, pred_image)
-            loss_dict["neus_depth"] = (
-                self.depth_loss(
-                    neus_depth.reshape(1, 32, -1),
-                    gs_depth.detach().reshape(1, 32, -1),
-                    mask,
-                )
-                * self.config.mono_depth_loss_mult
-                * loss_weight
-            )
-            loss_dict["neus_normal"] = (
-                monosdf_normal_loss(neus_normal, gs_normal.detach())
-                * self.config.mono_normal_loss_mult
-                * loss_weight
-                * normal_loss_mult
-            )
+            mask = torch.ones_like(gs_depth).reshape(1, 32, -1).bool()
+            # loss_dict["neus_depth"] = (
+            #     self.depth_loss(
+            #         neus_depth.reshape(1, 32, -1),
+            #         gs_depth.detach().reshape(1, 32, -1),
+            #         mask,
+            #     )
+            #     * self.config.mono_depth_loss_mult
+            #     * loss_weight
+            # )
+            # loss_dict["neus_normal"] = (
+            #     monosdf_normal_loss(neus_normal, gs_normal.detach())
+            #     * self.config.mono_normal_loss_mult
+            #     * loss_weight
+            #     * normal_loss_mult
+            # )
             grad_theta = outputs["eik_grad"]
             loss_dict["eikonal_loss"] = (
                 (grad_theta.norm(2, dim=-1) - 1) ** 2
             ).mean() * self.config.eikonal_loss_mult
             if self.step > self.config.scaffold_gs_pretrain + self.config.warmup_length:
                 loss_dict["gsdf_loss"] = (
-                    torch.abs(neus_depth.detach() - gs_depth).mean()
+                    self.depth_loss(
+                        neus_depth.detach().reshape(1, 32, -1),
+                        gs_depth.reshape(1, 32, -1),
+                        mask,
+                    )
                     * self.config.mono_depth_loss_mult
                     * loss_weight
-                    + cos_similarity_loss(neus_normal.detach(), gs_normal).mean()
+                    + monosdf_normal_loss(neus_normal.detach(), gs_normal)
                     * self.config.mono_normal_loss_mult
                     * loss_weight
                     * normal_loss_mult
@@ -936,7 +932,7 @@ class GSDFModel(NeuSModel):
             A dictionary of metrics.
         """
         gt_rgb = self.composite_with_background(
-            self.get_gt_img(batch["image"]), outputs["background"]
+            self.get_gt_img(batch["full_image"]), outputs["background"]
         )
         predicted_rgb = outputs["rgb"]
         cc_rgb = None
