@@ -11,7 +11,10 @@ from nerfstudio.data.datamanagers.full_images_datamanager import (
 )
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.engine.optimizers import AdamOptimizerConfig
-from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
+from nerfstudio.engine.schedulers import (
+    ExponentialDecaySchedulerConfig,
+    MultiStepSchedulerConfig,
+)
 from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.fields.sdf_field import SDFFieldConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
@@ -142,18 +145,24 @@ gsdf = MethodSpecification(
                 ),
                 near_plane=0.05,
                 far_plane=100,
-                mono_depth_loss_mult=0.5,
+                mono_depth_loss_mult=0.01,
                 mono_normal_loss_mult=0.01,
             ),
         ),
         optimizers={
+            "proposal_networks": {
+                "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
+                "scheduler": MultiStepSchedulerConfig(
+                    max_steps=45001, milestones=(15_000, 25000, 16500, 33000)
+                ),
+            },
             "fields": {
                 "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
                 "scheduler": DelayedCosineDecaySchedulerConfig(
                     pretrain_steps=15_000,
                     warm_up_end=500,
                     learning_rate_alpha=0.05,
-                    max_steps=20000,
+                    max_steps=45000,
                 ),
             },
             "field_background": {
@@ -162,7 +171,7 @@ gsdf = MethodSpecification(
                     pretrain_steps=15_000,
                     warm_up_end=500,
                     learning_rate_alpha=0.05,
-                    max_steps=20000,
+                    max_steps=45000,
                 ),
             },
             "anchor": {

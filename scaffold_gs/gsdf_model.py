@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from functools import reduce
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union, cast
 
+import numpy as np
 import torch
 import torchvision
 from einops import rearrange
@@ -15,7 +16,6 @@ from torch_scatter import scatter_max
 from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.cameras.rays import Frustums, RayBundle, RaySamples
 from nerfstudio.data.scene_box import OrientedBox
@@ -29,8 +29,8 @@ from nerfstudio.field_components.embedding import Embedding
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.mlp import MLP
 from nerfstudio.model_components.lib_bilagrid import color_correct
-from nerfstudio.model_components.losses import monosdf_normal_loss
-from nerfstudio.models.neus import NeuSModel, NeuSModelConfig
+from nerfstudio.model_components.losses import interlevel_loss, monosdf_normal_loss
+from nerfstudio.models.neus_facto import NeuSFactoModel, NeuSFactoModelConfig
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.math import k_nearest_sklearn
 
@@ -87,7 +87,7 @@ def resize_image(image: torch.Tensor, d: int):
 
 
 @dataclass
-class GSDFModelConfig(NeuSModelConfig):
+class GSDFModelConfig(NeuSFactoModelConfig):
     """GSDF Model Config"""
 
     _target: Type = field(default_factory=lambda: GSDFModel)
@@ -115,8 +115,6 @@ class GSDFModelConfig(NeuSModelConfig):
     densify_grad_threshold: float = 0.0002
     scaffold_gs_pretrain: int = 15_000
     normal_loss_warmup: int = 5000
-    # finetuning config
-    radius: float = 3.0
 
     resolution_schedule: int = 3000
     """training starts at 1/d resolution, every n steps this is doubled"""
@@ -136,15 +134,11 @@ class GSDFModelConfig(NeuSModelConfig):
     """weight of ssim loss"""
     stop_split_at: int = 15000
     """stop splitting at this step"""
-    camera_optimizer: CameraOptimizerConfig = field(
-        default_factory=lambda: CameraOptimizerConfig(mode="off")
-    )
-    """Config of the camera optimizer to use"""
     color_corrected_metrics: bool = False
     """If True, apply color correction to the rendered images before computing the metrics."""
 
 
-class GSDFModel(NeuSModel):
+class GSDFModel(NeuSFactoModel):
     """Nerfstudio implementation of GSDF
 
     Args:
@@ -258,10 +252,6 @@ class GSDFModel(NeuSModel):
             }
         )
 
-        self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
-            num_cameras=self.num_train_data, device="cpu"
-        )
-
         # metrics
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
         self.ssim = SSIM(data_range=1.0, size_average=True, channel=3)
@@ -276,7 +266,7 @@ class GSDFModel(NeuSModel):
         else:
             self.background_color = get_color(self.config.background_color)
 
-        self.depth_sampler = GSDFDepthSampler(radius=self.config.radius)
+        # self.depth_sampler = GSDFDepthSampler(radius=self.config.radius)
 
     @property
     def num_points(self):
@@ -432,6 +422,37 @@ class GSDFModel(NeuSModel):
     ) -> List[TrainingCallback]:
         cbs = []
 
+        if self.config.use_proposal_weight_anneal:
+            # anneal the weights of the proposal network before doing PDF sampling
+            N = self.config.proposal_weights_anneal_max_num_iters
+
+            def set_anneal(step: int):
+                # https://arxiv.org/pdf/2111.12077.pdf eq. 18
+                train_frac = np.clip(
+                    (step - self.config.scaffold_gs_pretrain) / N, 0, 1
+                )
+
+                def bias(x, b):
+                    return b * x / ((b - 1) * x + 1)
+
+                anneal = bias(train_frac, self.config.proposal_weights_anneal_slope)
+                self.proposal_sampler.set_anneal(anneal)
+
+            cbs.append(
+                TrainingCallback(
+                    where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                    update_every_num_iters=1,
+                    func=set_anneal,
+                )
+            )
+            cbs.append(
+                TrainingCallback(
+                    where_to_run=[TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+                    update_every_num_iters=1,
+                    func=self.proposal_sampler.step_cb,
+                )
+            )
+
         if self.anneal_end > 0:
 
             def set_anneal(step):
@@ -526,7 +547,6 @@ class GSDFModel(NeuSModel):
         """
         param_groups = super().get_param_groups()
         self.get_gaussian_param_groups(param_groups=param_groups)
-        self.camera_optimizer.get_param_groups(param_groups=param_groups)
         param_groups["mlp_opacity"] = list(self.opacity_mlp.parameters())
         param_groups["mlp_feature_bank"] = list(self.featurebank_mlp.parameters())
         param_groups["mlp_cov"] = list(self.mlp_cov.parameters())
@@ -592,7 +612,7 @@ class GSDFModel(NeuSModel):
         """
         assert camera is not None, "must provide camera to gaussian model"
         self.set_crop(obb_box)
-        outs = self.get_outputs(camera.to(self.device))
+        outs = self.get_outputs(camera)
         return outs  # type: ignore
 
     def get_outputs(
@@ -607,7 +627,15 @@ class GSDFModel(NeuSModel):
         Returns:
             Outputs of model. (ie. rendered colors)
         """
-        camera = ray_bundle.extra["camera"]
+        if isinstance(ray_bundle, RayBundle):
+            if not hasattr(ray_bundle, "extra"):
+                return super().get_outputs(ray_bundle)
+            camera = ray_bundle.extra["camera"]
+        elif isinstance(ray_bundle, Cameras):
+            camera = ray_bundle
+        else:
+            print("Called get_outputs with something other than a raybundle or camera")
+            return {}
 
         # during eval the camera gets clone for each raybundle for some reason
         if camera.shape[0] > 1:
@@ -681,7 +709,9 @@ class GSDFModel(NeuSModel):
             "scaling": scaling,
         }  # type: ignore
 
-        if self.step > self.config.scaffold_gs_pretrain:
+        if self.step > self.config.scaffold_gs_pretrain and isinstance(
+            ray_bundle, RayBundle
+        ):
             rot = camera.camera_to_worlds[0, :3, :3].to(self.device)
 
             normal_map = ((gs_normal * 2) - 1).reshape(3, -1)
@@ -694,8 +724,10 @@ class GSDFModel(NeuSModel):
             ray_x_indices = torch.clamp(ray_x_indices, min=0, max=W - 1).int()
             ray_y_indices = ray_bundle.extra["indices"][:, 1] // camera_scale_fac
             ray_y_indices = torch.clamp(ray_y_indices, min=0, max=H - 1).int()
+
             gs_depth = depth[ray_y_indices, ray_x_indices]
             gs_normal = normal[ray_y_indices, ray_x_indices]
+
             samples_and_field_outputs = self.sample_and_forward_field(
                 ray_bundle=ray_bundle  # , metric_depth=gs_depth
             )
@@ -754,7 +786,10 @@ class GSDFModel(NeuSModel):
                 gs_normal,
                 neus_accumulation,
             )
-            return_dict["eik_grad"] = grad_points
+
+            if self.training:
+                return_dict.update({"eik_grad": grad_points})
+                return_dict.update(samples_and_field_outputs)
 
         return return_dict
 
@@ -809,7 +844,6 @@ class GSDFModel(NeuSModel):
                 1.0 / self.field.deviation_network.get_variance().item()
             )
 
-        self.camera_optimizer.get_metrics_dict(metrics_dict)
         return metrics_dict
 
     def get_loss_dict(
@@ -847,13 +881,10 @@ class GSDFModel(NeuSModel):
             + self.config.ssim_lambda * simloss,
         }
 
-        if self.training:
-            # Add loss from camera optimizer
-            self.camera_optimizer.get_loss_dict(loss_dict)
-
-        if self.step > self.config.scaffold_gs_pretrain:
+        if self.step > self.config.scaffold_gs_pretrain and self.training:
             scaling_reg = outputs["scaling"].prod(dim=1).mean()
             loss_dict["main_loss"] += 0.01 * scaling_reg
+
             (
                 neus_rgb,
                 neus_depth,
@@ -862,44 +893,56 @@ class GSDFModel(NeuSModel):
                 gs_normal,
                 neus_accumulation,
             ) = outputs["neus_info"]
+
+            mask = torch.ones_like(gs_depth).reshape(1, 32, -1).bool()
+
             loss_weight = (
                 1 / 10
                 if self.step
                 > self.config.scaffold_gs_pretrain + self.config.warmup_length + 15000
                 else 1
             )
+
             normal_loss_mult = (
                 0
                 if self.step
                 < self.config.scaffold_gs_pretrain + self.config.normal_loss_warmup
                 else 1
             )
+
             pred_image, image = self.renderer_rgb.blend_background_for_loss_computation(
                 pred_image=neus_rgb,
                 pred_accumulation=neus_accumulation,
                 gt_image=batch["image"].to(self.device),
             )
             loss_dict["neus_loss"] = self.rgb_loss(image, pred_image)
-            mask = torch.ones_like(gs_depth).reshape(1, 32, -1).bool()
-            # loss_dict["neus_depth"] = (
-            #     self.depth_loss(
-            #         neus_depth.reshape(1, 32, -1),
-            #         gs_depth.detach().reshape(1, 32, -1),
-            #         mask,
-            #     )
-            #     * self.config.mono_depth_loss_mult
-            #     * loss_weight
-            # )
-            # loss_dict["neus_normal"] = (
-            #     monosdf_normal_loss(neus_normal, gs_normal.detach())
-            #     * self.config.mono_normal_loss_mult
-            #     * loss_weight
-            #     * normal_loss_mult
-            # )
+
+            loss_dict["neus_depth"] = (
+                self.depth_loss(
+                    neus_depth.reshape(1, 32, -1),
+                    gs_depth.detach().reshape(1, 32, -1),
+                    mask,
+                )
+                * self.config.mono_depth_loss_mult
+                * loss_weight
+            )
+
+            loss_dict["neus_normal"] = (
+                monosdf_normal_loss(neus_normal, gs_normal.detach())
+                * self.config.mono_normal_loss_mult
+                * loss_weight
+                * normal_loss_mult
+            )
+
             grad_theta = outputs["eik_grad"]
             loss_dict["eikonal_loss"] = (
                 (grad_theta.norm(2, dim=-1) - 1) ** 2
             ).mean() * self.config.eikonal_loss_mult
+            loss_dict["interlevel_loss"] = (
+                self.config.interlevel_loss_mult
+                * interlevel_loss(outputs["weights_list"], outputs["ray_samples_list"])
+            )
+
             if self.step > self.config.scaffold_gs_pretrain + self.config.warmup_length:
                 loss_dict["gsdf_loss"] = (
                     self.depth_loss(
@@ -1028,6 +1071,7 @@ class GSDFModel(NeuSModel):
                 or "feat_base" in optim_name
                 or "embedding" in optim_name
                 or "field" in optim_name
+                or "proposal" in optim_name
             ):
                 continue
             optim = self.optimizers[optim_name]
@@ -1071,6 +1115,7 @@ class GSDFModel(NeuSModel):
                 or "feat_base" in optim_name
                 or "embedding" in optim_name
                 or "field" in optim_name
+                or "proposal" in optim_name
             ):
                 continue
 
