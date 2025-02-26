@@ -15,6 +15,7 @@ class NeuSAccSampler(Sampler):
         aabb,
         neus_sampler: NeuSSampler = None,
         resolution: int = 128,
+        grid_levels: int = 4,
         num_samples: int = 8,
         num_samples_importance: int = 16,
         num_samples_boundary: int = 10,
@@ -27,6 +28,7 @@ class NeuSAccSampler(Sampler):
         super().__init__()
         self.aabb = aabb
         self.resolution = resolution
+        self.grid_levels = grid_levels
         self.num_samples = num_samples
         self.num_samples_importance = num_samples_importance
         self.num_samples_boundary = num_samples_boundary
@@ -44,10 +46,16 @@ class NeuSAccSampler(Sampler):
         self.grid_size = self.resolution
         self.voxel_size = (aabb[1, 0] - aabb[0, 0]) / self.grid_size
 
-        # nesu_sampler at the begining of training
+        # neus_sampler at the begining of training
         self.neus_sampler = neus_sampler
 
-        self.grid = nerfacc.OccupancyGrid(aabb.reshape(-1), resolution=self.resolution)
+        self.grid = nerfacc.OccGridEstimator(
+            roi_aabb=aabb.reshape(-1),
+            resolution=self.resolution,
+            levels=self.grid_levels,
+        )
+        self.grid.binaries[:] = True
+
         self.register_buffer(
             "_binary",
             torch.ones(
@@ -178,42 +186,38 @@ class NeuSAccSampler(Sampler):
         assert alpha_fn is not None
 
         # sampling from occupancy grids
-        packed_info, ray_indices, t_starts, t_ends = nerfacc.cuda.ray_marching(
+        ray_indices, t_starts, t_ends = self.grid.sampling(
             ray_bundle.origins.contiguous(),
             ray_bundle.directions.contiguous(),
-            ray_bundle.nears[:, 0].contiguous(),
-            ray_bundle.fars[:, 0].contiguous(),
-            self.grid.roi_aabb.contiguous(),
-            self._binary,
-            self.grid.contraction_type.to_cpp_version(),
-            self.step_size,  # TODO stepsize based on inv_s value?
-            0.0,
+            t_min=ray_bundle.nears[:, 0].contiguous(),
+            t_max=ray_bundle.fars[:, 0].contiguous(),
+            render_step_size=self.step_size,  # TODO stepsize based on inv_s value?
         )
 
         # create ray_samples with the intersection
         ray_indices = ray_indices.long()
         ray_samples = self.create_ray_samples_from_ray_indices(
-            ray_bundle, ray_indices, t_starts, t_ends
+            ray_bundle, ray_indices, t_starts.unsqueeze(1), t_ends.unsqueeze(1)
         )
 
-        if self.importance_sampling and ray_samples.shape[0] > 0:
-            # save_points("first.ply", ray_samples.frustums.get_start_positions().cpu().numpy().reshape(-1, 3))
+        # if self.importance_sampling and ray_samples.shape[0] > 0:
+        #     # save_points("first.ply", ray_samples.frustums.get_start_positions().cpu().numpy().reshape(-1, 3))
 
-            alphas = alpha_fn(ray_samples)
-            weights = nerfacc.render_weight_from_alpha(
-                alphas, ray_indices=ray_indices, n_rays=ray_bundle.shape[0]
-            )
+        #     alphas = alpha_fn(ray_samples)
+        #     weights = nerfacc.render_weight_from_alpha(
+        #         alphas, ray_indices=ray_indices, n_rays=ray_bundle.shape[0]
+        #     )
 
-            # TODO make it configurable
-            # re sample
-            packed_info, t_starts, t_ends = nerfacc.ray_resampling(
-                packed_info, t_starts, t_ends, weights[:, 0], 16
-            )
-            ray_indices = nerfacc.unpack_info(packed_info, t_starts.shape[0])
-            ray_samples = self.create_ray_samples_from_ray_indices(
-                ray_bundle, ray_indices, t_starts, t_ends
-            )
+        #     # TODO make it configurable
+        #     # re sample
+        #     packed_info, t_starts, t_ends = nerfacc.ray_resampling(
+        #         packed_info, t_starts, t_ends, weights[:, 0], 16
+        #     )
+        #     ray_indices = nerfacc.unpack_info(packed_info, t_starts.shape[0])
+        #     ray_samples = self.create_ray_samples_from_ray_indices(
+        #         ray_bundle, ray_indices, t_starts, t_ends
+        #     )
 
-            # save_points("second.ply", ray_samples.frustums.get_start_positions().cpu().numpy().reshape(-1, 3))
+        #     # save_points("second.ply", ray_samples.frustums.get_start_positions().cpu().numpy().reshape(-1, 3))
 
         return ray_samples, ray_indices
