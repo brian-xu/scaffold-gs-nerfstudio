@@ -145,13 +145,13 @@ gsdf = MethodSpecification(
                 ),
                 near_plane=0.05,
                 far_plane=100,
-                mono_depth_loss_mult=0.01,
+                mono_depth_loss_mult=0.05,
                 mono_normal_loss_mult=0.01,
             ),
         ),
         optimizers={
             "proposal_networks": {
-                "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=3e-2, eps=1e-15),
                 "scheduler": MultiStepSchedulerConfig(
                     max_steps=45001, milestones=(15_000, 25000, 16500, 33000)
                 ),

@@ -3,17 +3,24 @@ Unofficial implementation of [Scaffold-GS](https://github.com/city-super/Scaffol
 
 https://github.com/user-attachments/assets/f7194455-e4a0-4c60-9608-837ef635f22b
 
+## GSDF: 3DGS Meets SDF for Improved Neural Rendering and Reconstruction
+Now includes an implementation of [GSDF](https://github.com/city-super/GSDF) as a [nerfstudio](https://github.com/nerfstudio-project/nerfstudio) extension.
+
+#### Note: there are several differences when compared to the reference implementation, as we build off of the nerfstudio implementation of NeuS.
+
 ## Status
 
 - [ ] Functionality
   - [x] Correctly rendering and training
   - [x] Anchor adjustment
-  - [ ] ...
+  - [x] GSDF implementation
+  - [ ] Debugging
 - [ ] Visualization
   - [x] Fix viser functionality
   - [ ] ...
 - [ ] Extras
-  - [ ] Mesh export
+  - [ ] Scaffold-GS baked splat export
+  - [ ] GSDF mesh export
   - [ ] ...
 
 
@@ -49,6 +56,16 @@ This repository creates a new Nerfstudio method named "scaffold-gs". To train wi
 ns-train scaffold-gs --data [PATH]
 ```
 
+GSDF can be run via the following command:
+```
+# for indoor scenes
+ns-train gsdf --data [PATH] --pipeline.model.sdf-field.inside-outside True
+# for object scenes
+ns-train gsdf --data [PATH] --pipeline.model.sdf-field.inside-outside False
+```
+
+Unbounded scenes are not supported, but might work with `--pipeline.model.sdf-field.inside-outside True`.
+
 ## Acknowledgements
 
 Thanks to the authors of [Scaffold-GS](https://github.com/city-super/Scaffold-GS) for the reference implementation, which we build upon heavily.
@@ -65,4 +82,19 @@ Thanks to the authors of [Scaffold-GS](https://github.com/city-super/Scaffold-GS
 }
 ```
 
+Thanks to the authors of [GSDF](https://github.com/city-super/GSDF)  for the reference implementation of GSDF, which we build upon heavily.
+
+### GSDF: 3DGS Meets SDF for Improved Neural Rendering and Reconstruction
+
+```bibtex
+@article{yu2024gsdf,
+  title={Gsdf: 3dgs meets sdf for improved rendering and reconstruction},
+  author={Yu, Mulin and Lu, Tao and Xu, Linning and Jiang, Lihan and Xiangli, Yuanbo and Dai, Bo},
+  journal={arXiv preprint arXiv:2403.16964},
+  year={2024}
+}
+```
+
 Thanks to the authors of [Splatfacto-360](https://github.com/myuito3/splatfacto-360) for their code converting nerfstudio cameras to the COLMAP format.
+
+Thanks to the authors of [dn-splatter](https://github.com/maturk/dn-splatter) for providing examples of how to export splats from a nerfstudio extension.

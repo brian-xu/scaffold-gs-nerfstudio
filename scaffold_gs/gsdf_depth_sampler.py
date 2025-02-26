@@ -6,7 +6,6 @@ from torch import Tensor
 
 from nerfstudio.cameras.rays import RayBundle, RaySamples
 from nerfstudio.model_components.ray_samplers import Sampler
-from nerfstudio.scripts.datasets.process_project_aria import T_ARIA_NERFSTUDIO
 
 
 class GSDFDepthSampler(Sampler):
