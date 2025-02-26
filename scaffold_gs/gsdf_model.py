@@ -8,7 +8,8 @@ import torchvision
 from einops import rearrange
 from jaxtyping import Shaped
 from pytorch_msssim import SSIM
-from scaffold_gs.gsdf_depth_sampler import GSDFDepthSampler
+
+# from scaffold_gs.gsdf_depth_sampler import GSDFDepthSampler
 from scaffold_gs.scaffold_gs_renderer import prefilter_voxel, scaffold_gs_render
 from torch import Tensor
 from torch.nn import Parameter
@@ -37,13 +38,6 @@ from nerfstudio.utils.math import k_nearest_sklearn
 
 def inverse_sigmoid(x):
     return torch.log(x / (1 - x))
-
-
-def cos_similarity_loss(a, b):
-    return (
-        1.0
-        - ((a * b).sum(dim=-1) / (a.norm(dim=-1) * b.norm(dim=-1) + 1e-8)).abs().mean()
-    )
 
 
 def rays_from_positions(positions: Shaped[Tensor, "*bs 3"]) -> Shaped[Tensor, "*bs 1"]:
@@ -712,13 +706,6 @@ class GSDFModel(NeuSFactoModel):
         if self.step > self.config.scaffold_gs_pretrain and isinstance(
             ray_bundle, RayBundle
         ):
-            rot = camera.camera_to_worlds[0, :3, :3].to(self.device)
-
-            normal_map = ((gs_normal * 2) - 1).reshape(3, -1)
-            normal_map = torch.nn.functional.normalize(normal_map, p=2, dim=0)
-
-            normal_map = rot @ normal_map
-            normal = normal_map.permute(1, 0).reshape(*gs_normal.shape[1:], 3)
 
             ray_x_indices = ray_bundle.extra["indices"][:, 2] // camera_scale_fac
             ray_x_indices = torch.clamp(ray_x_indices, min=0, max=W - 1).int()
@@ -974,8 +961,12 @@ class GSDFModel(NeuSFactoModel):
         Returns:
             A dictionary of metrics.
         """
+        if "full_image" not in batch:
+            gt_img = batch["image"]
+        else:
+            gt_img = batch["full_image"]
         gt_rgb = self.composite_with_background(
-            self.get_gt_img(batch["full_image"]), outputs["background"]
+            self.get_gt_img(gt_img), outputs["background"]
         )
         predicted_rgb = outputs["rgb"]
         cc_rgb = None
