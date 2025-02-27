@@ -260,6 +260,8 @@ class GSDFModel(NeuSFactoModel):
         else:
             self.background_color = get_color(self.config.background_color)
 
+        self.ray_collider, self.collider = self.collider, None
+
         # self.depth_sampler = GSDFDepthSampler(radius=self.config.radius)
 
     @property
@@ -622,6 +624,7 @@ class GSDFModel(NeuSFactoModel):
             Outputs of model. (ie. rendered colors)
         """
         if isinstance(ray_bundle, RayBundle):
+            ray_bundle = self.ray_collider(ray_bundle)
             if not hasattr(ray_bundle, "extra"):
                 return super().get_outputs(ray_bundle)
             camera = ray_bundle.extra["camera"]
@@ -685,9 +688,7 @@ class GSDFModel(NeuSFactoModel):
         rgb = rearrange(render, "c h w -> h w c")
         rgb = torch.clamp(rgb, 0.0, 1.0)
 
-        depth = torchvision.transforms.Normalize(mean=0.5, std=0.5)(
-            rearrange(gs_depth, "c h w -> h w c")[..., 0].unsqueeze(0).unsqueeze(0)
-        ).squeeze()
+        depth = rearrange(gs_depth, "c h w -> h w c")[..., 0]
         accumulation = depth
         normal = (rearrange(gs_normal, "c h w -> h w c") + 1) / 2
 

@@ -47,17 +47,21 @@ class GSDFDataManager(VanillaDataManager):
         image_batch = next(self.iter_train_image_dataloader)
         assert self.train_pixel_sampler is not None
         assert isinstance(image_batch, dict)
-        batch = self.train_pixel_sampler.sample(image_batch)
-        ray_indices = batch["indices"]
-        ray_bundle = self.train_ray_generator(ray_indices)
         camera = self.train_dataset.cameras[
             image_batch["image_idx"][0] : image_batch["image_idx"][0] + 1
         ]
-        ray_bundle.extra = {}
-        ray_bundle.extra["camera"] = camera
-        ray_bundle.extra["indices"] = ray_indices
-        batch["full_image"] = image_batch["image"][0]
-        return ray_bundle, batch
+        if step == 0 or step > self.config.scaffold_gs_pretrain:
+            batch = self.train_pixel_sampler.sample(image_batch)
+            ray_indices = batch["indices"]
+            ray_bundle = self.train_ray_generator(ray_indices)
+            ray_bundle.extra = {}
+            ray_bundle.extra["camera"] = camera
+            ray_bundle.extra["indices"] = ray_indices
+            batch["full_image"] = image_batch["image"][0]
+            return ray_bundle, batch
+        else:
+            image_batch["full_image"] = image_batch["image"][0]
+            return camera, image_batch
 
     def next_eval(self, step: int) -> Tuple[RayBundle, Dict]:
         """Returns the next batch of data from the eval dataloader."""
@@ -65,14 +69,18 @@ class GSDFDataManager(VanillaDataManager):
         image_batch = next(self.iter_eval_image_dataloader)
         assert self.eval_pixel_sampler is not None
         assert isinstance(image_batch, dict)
-        batch = self.eval_pixel_sampler.sample(image_batch)
-        ray_indices = batch["indices"]
-        ray_bundle = self.eval_ray_generator(ray_indices)
         camera = self.eval_dataset.cameras[
             image_batch["image_idx"][0] : image_batch["image_idx"][0] + 1
         ]
-        ray_bundle.extra = {}
-        ray_bundle.extra["camera"] = camera
-        ray_bundle.extra["indices"] = ray_indices
-        batch["full_image"] = image_batch["image"][0]
-        return ray_bundle, batch
+        if step == 0 or step > self.config.scaffold_gs_pretrain:
+            batch = self.eval_pixel_sampler.sample(image_batch)
+            ray_indices = batch["indices"]
+            ray_bundle = self.eval_ray_generator(ray_indices)
+            ray_bundle.extra = {}
+            ray_bundle.extra["camera"] = camera
+            ray_bundle.extra["indices"] = ray_indices
+            batch["full_image"] = image_batch["image"][0]
+            return ray_bundle, batch
+        else:
+            image_batch["full_image"] = image_batch["image"][0]
+            return camera, image_batch
