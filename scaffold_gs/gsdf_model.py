@@ -4,10 +4,10 @@ from typing import Dict, List, Literal, Optional, Tuple, Type, Union, cast
 
 import numpy as np
 import torch
-import torchvision
 from einops import rearrange
 from jaxtyping import Shaped
 from pytorch_msssim import SSIM
+from scaffold_gs.gaussian_splatting.cameras import depth_double_to_normal
 
 # from scaffold_gs.gsdf_depth_sampler import GSDFDepthSampler
 from scaffold_gs.scaffold_gs_renderer import prefilter_voxel, scaffold_gs_render
@@ -652,8 +652,6 @@ class GSDFModel(NeuSFactoModel):
             background,
             visible_mask=voxel_visible_mask,
             retain_grad=retain_grad,
-            out_depth=True,
-            return_normal=True,
         )
         camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
 
@@ -675,8 +673,14 @@ class GSDFModel(NeuSFactoModel):
             render_pkg["radii"],
             render_pkg["scaling"],
             render_pkg["neural_opacity"],
-            render_pkg["depth_hand"],
+            render_pkg["expected_depth"],
             render_pkg["gs_normal"],
+        )
+
+        rendered_expected_depth: torch.Tensor = render_pkg["expected_depth"]
+        rendered_median_depth: torch.Tensor = render_pkg["median_depth"]
+        depth_middepth_normal = depth_double_to_normal(
+            camera, rendered_expected_depth, rendered_median_depth
         )
 
         self.viewspace_point_tensor = viewspace_point_tensor

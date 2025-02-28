@@ -19,6 +19,57 @@ import torch
 from nerfstudio.cameras.cameras import Cameras as NerfstudioCamera
 
 
+# the following functions depths_double_to_points and depth_double_to_normal are adopted from https://github.com/hugoycj/2dgs-gaustudio/blob/main/utils/graphics_utils.py
+def depths_double_to_points(camera: NerfstudioCamera, depthmap1, depthmap2):
+    colmap_camera: ColmapCamera = convert_to_colmap_camera(camera)
+    W, H = colmap_camera.image_width, colmap_camera.image_height
+    fx = W / (2 * math.tan(colmap_camera.FoVx / 2.0))
+    fy = H / (2 * math.tan(colmap_camera.FoVy / 2.0))
+    intrins_inv = (
+        torch.tensor(
+            [
+                [1 / fx, 0.0, -W / (2 * fx)],
+                [
+                    0.0,
+                    1 / fy,
+                    -H / (2 * fy),
+                ],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        .float()
+        .cuda()
+    )
+    grid_x, grid_y = torch.meshgrid(
+        torch.arange(W) + 0.5, torch.arange(H) + 0.5, indexing="xy"
+    )
+    points = (
+        torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=0)
+        .reshape(3, -1)
+        .float()
+        .cuda()
+    )
+    rays_d = intrins_inv @ points
+    points1 = depthmap1.reshape(1, -1) * rays_d
+    points2 = depthmap2.reshape(1, -1) * rays_d
+    return points1.reshape(3, H, W), points2.reshape(3, H, W)
+
+
+def point_double_to_normal(camera: NerfstudioCamera, points1, points2):
+    points = torch.stack([points1, points2], dim=0)
+    output = torch.zeros_like(points)
+    dx = points[..., 2:, 1:-1] - points[..., :-2, 1:-1]
+    dy = points[..., 1:-1, 2:] - points[..., 1:-1, :-2]
+    normal_map = torch.nn.functional.normalize(torch.cross(dx, dy, dim=1), dim=1)
+    output[..., 1:-1, 1:-1] = normal_map
+    return output
+
+
+def depth_double_to_normal(camera: NerfstudioCamera, depth1, depth2):
+    points1, points2 = depths_double_to_points(camera, depth1, depth2)
+    return point_double_to_normal(camera, points1, points2)
+
+
 class ColmapCamera:
     def __init__(
         self,

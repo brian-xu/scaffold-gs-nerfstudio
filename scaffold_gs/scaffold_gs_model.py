@@ -7,6 +7,7 @@ from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 import torch
 from einops import rearrange
 from pytorch_msssim import SSIM
+from scaffold_gs.gaussian_splatting.cameras import depth_double_to_normal
 from scaffold_gs.scaffold_gs_renderer import prefilter_voxel, scaffold_gs_render
 from torch.nn import Parameter
 from torch_scatter import scatter_max
@@ -106,6 +107,8 @@ class ScaffoldGSModelConfig(ModelConfig):
     """Config of the camera optimizer to use"""
     color_corrected_metrics: bool = False
     """If True, apply color correction to the rendered images before computing the metrics."""
+    regularization_from_iter = 15_000
+    lambda_depth_normal = 0.05
 
 
 class ScaffoldGSModel(Model):
@@ -465,9 +468,7 @@ class ScaffoldGSModel(Model):
             background,
             visible_mask=voxel_visible_mask,
             retain_grad=retain_grad,
-            out_depth=True,
         )
-        camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
 
         (
             render,
@@ -477,7 +478,8 @@ class ScaffoldGSModel(Model):
             radii,
             scaling,
             opacity,
-            gs_depth_hand,
+            gs_depth,
+            gs_normal,
         ) = (
             render_pkg["render"],
             render_pkg["viewspace_points"],
@@ -486,8 +488,19 @@ class ScaffoldGSModel(Model):
             render_pkg["radii"],
             render_pkg["scaling"],
             render_pkg["neural_opacity"],
-            render_pkg["depth_hand"],
+            render_pkg["expected_depth"],
+            render_pkg["gs_normal"],
         )
+
+        rendered_median_depth: torch.Tensor = render_pkg["median_depth"]
+        depth_middepth_normal = depth_double_to_normal(
+            camera, gs_depth, rendered_median_depth
+        )
+        normal_error_map = 1 - (gs_normal.unsqueeze(0) * depth_middepth_normal).sum(
+            dim=1
+        )
+
+        camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
 
         self.viewspace_point_tensor = viewspace_point_tensor
         self.neural_opacity = opacity
@@ -498,8 +511,9 @@ class ScaffoldGSModel(Model):
         rgb = rearrange(render, "c h w -> h w c")
         rgb = torch.clamp(rgb, 0.0, 1.0)
 
-        depth = rearrange(gs_depth_hand, "c h w -> h w c")[..., 0] * 1000
-        accumulation = background.new_zeros(*rgb.shape[:2], 1)
+        depth = rearrange(gs_depth, "c h w -> h w c")[..., 0]
+        accumulation = depth
+        normal = (rearrange(gs_normal, "c h w -> h w c") + 1) / 2
 
         if background.shape[0] == 3 and not self.training:
             background = background.expand(H, W, 3)
@@ -507,8 +521,10 @@ class ScaffoldGSModel(Model):
         return {
             "rgb": rgb.squeeze(0),  # type: ignore
             "depth": depth.unsqueeze(-1),  # type: ignore
-            "accumulation": accumulation,  # type: ignore
+            "normal": normal.squeeze(0),  # type: ignore
+            "accumulation": accumulation.unsqueeze(-1),  # type: ignore
             "background": background,  # type: ignore
+            "normal_error_map": normal_error_map.squeeze(0),  # type: ignore
         }  # type: ignore
 
     def get_gt_img(self, image: torch.Tensor):
@@ -592,6 +608,14 @@ class ScaffoldGSModel(Model):
             "main_loss": (1 - self.config.ssim_lambda) * Ll1
             + self.config.ssim_lambda * simloss,
         }
+
+        if self.step > self.config.regularization_from_iter:
+            depth_ratio = 0.6
+
+            loss_dict["depth_normal_loss"] = (
+                loss_dict * (1 - depth_ratio) * outputs["normal_error_map"][0].mean()
+                + depth_ratio * outputs["normal_error_map"][1].mean()
+            ) * self.config.lambda_depth_normal
 
         if self.training:
             # Add loss from camera optimizer
