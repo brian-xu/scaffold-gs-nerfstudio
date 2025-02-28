@@ -613,7 +613,7 @@ class ScaffoldGSModel(Model):
             depth_ratio = 0.6
 
             loss_dict["depth_normal_loss"] = (
-                loss_dict * (1 - depth_ratio) * outputs["normal_error_map"][0].mean()
+                (1 - depth_ratio) * outputs["normal_error_map"][0].mean()
                 + depth_ratio * outputs["normal_error_map"][1].mean()
             ) * self.config.lambda_depth_normal
 
