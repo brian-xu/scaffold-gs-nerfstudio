@@ -70,30 +70,7 @@ Unbounded scenes are not supported, but might work with `--pipeline.model.sdf-fi
 
 Thanks to the authors of [Scaffold-GS](https://github.com/city-super/Scaffold-GS) for the reference implementation, which we build upon heavily.
 
-### Scaffold-GS: Structured 3D Gaussians for View-Adaptive Rendering
-
-```bibtex
-@inproceedings{scaffoldgs,
-  title={Scaffold-gs: Structured 3d gaussians for view-adaptive rendering},
-  author={Lu, Tao and Yu, Mulin and Xu, Linning and Xiangli, Yuanbo and Wang, Limin and Lin, Dahua and Dai, Bo},
-  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
-  pages={20654--20664},
-  year={2024}
-}
-```
-
-Thanks to the authors of [GSDF](https://github.com/city-super/GSDF)  for the reference implementation of GSDF, which we build upon heavily.
-
-### GSDF: 3DGS Meets SDF for Improved Neural Rendering and Reconstruction
-
-```bibtex
-@article{yu2024gsdf,
-  title={Gsdf: 3dgs meets sdf for improved rendering and reconstruction},
-  author={Yu, Mulin and Lu, Tao and Xu, Linning and Jiang, Lihan and Xiangli, Yuanbo and Dai, Bo},
-  journal={arXiv preprint arXiv:2403.16964},
-  year={2024}
-}
-```
+Thanks to the authors of [GSDF](https://github.com/city-super/GSDF) for the reference implementation of GSDF, which we build upon heavily.
 
 Thanks to the authors of [Splatfacto-360](https://github.com/myuito3/splatfacto-360) for their code converting nerfstudio cameras to the COLMAP format.
 
