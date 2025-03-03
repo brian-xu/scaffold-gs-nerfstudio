@@ -19,7 +19,7 @@ class NeuSAccSampler(Sampler):
         num_samples: int = 8,
         num_samples_importance: int = 16,
         num_samples_boundary: int = 10,
-        steps_warpup: int = 2000,
+        steps_warpup: int = 1000,
         steps_per_grid_update: int = 1000,
         importance_sampling: bool = False,
         local_rank: int = 0,
@@ -99,7 +99,9 @@ class NeuSAccSampler(Sampler):
         assert sdf_fn is not None
         assert inv_s is not None
 
-        if step >= self.steps_warpup and step % self.steps_per_grid_update == 0:
+        if step >= self.steps_warpup and (
+            step % self.steps_per_grid_update == 0 or self._update_counter == 0
+        ):
 
             mask = self._binary.reshape(-1)
             # TODO voxels can't be recovered once it is pruned

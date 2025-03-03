@@ -19,7 +19,7 @@ Implementation of VolSDF.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Type
+from typing import Dict, List, Type
 
 import nerfacc
 import torch
@@ -103,36 +103,36 @@ class NeuSAccModel(NeuSModel):
             field_outputs = self.field(ray_samples, return_alphas=True)
 
             n_rays = ray_bundle.shape[0]
-            weights = nerfacc.render_weight_from_alpha(
-                field_outputs[FieldHeadNames.ALPHA],
+            weights, trans = nerfacc.render_weight_from_alpha(
+                field_outputs[FieldHeadNames.ALPHA].flatten(),
                 ray_indices=ray_indices,
                 n_rays=n_rays,
             )
             rgb = nerfacc.accumulate_along_rays(
                 weights,
-                ray_indices,
                 values=field_outputs[FieldHeadNames.RGB],
+                ray_indices=ray_indices,
                 n_rays=n_rays,
             )
             normal = nerfacc.accumulate_along_rays(
                 weights,
-                ray_indices,
-                values=field_outputs[FieldHeadNames.NORMAL],
+                values=field_outputs[FieldHeadNames.NORMALS],
+                ray_indices=ray_indices,
                 n_rays=n_rays,
             )
 
             accumulation = nerfacc.accumulate_along_rays(
-                weights, ray_indices, values=None, n_rays=n_rays
+                weights, values=None, ray_indices=ray_indices, n_rays=n_rays
             )
             depth = nerfacc.accumulate_along_rays(
                 weights,
-                ray_indices,
                 values=(ray_samples.frustums.starts + ray_samples.frustums.ends) / 2,
+                ray_indices=ray_indices,
                 n_rays=n_rays,
             )
 
             # the rendered depth is point-to-point distance and we should convert to depth
-            depth = depth / ray_bundle.directions_norm
+            depth = depth / ray_bundle.metadata["directions_norm"]
 
             outputs = {
                 "rgb": rgb,
