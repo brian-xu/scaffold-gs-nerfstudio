@@ -138,16 +138,10 @@ gsdf = MethodSpecification(
             ),
             model=GSDFModelConfig(
                 sdf_field=SDFFieldConfig(
-                    use_grid_feature=True,
                     num_layers=2,
-                    num_layers_color=2,
-                    hidden_dim=256,
                     bias=0.5,
-                    beta_init=0.8,
-                    use_appearance_embedding=True,
+                    beta_init=0.3,
                 ),
-                near_plane=0.05,
-                far_plane=100,
                 mono_depth_loss_mult=0.05,
                 mono_normal_loss_mult=0.01,
             ),

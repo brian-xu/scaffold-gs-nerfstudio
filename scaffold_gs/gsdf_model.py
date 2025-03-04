@@ -8,8 +8,6 @@ from einops import rearrange
 from jaxtyping import Shaped
 from pytorch_msssim import SSIM
 from scaffold_gs.gaussian_splatting.cameras import depth_double_to_normal
-
-# from scaffold_gs.gsdf_depth_sampler import GSDFDepthSampler
 from scaffold_gs.scaffold_gs_renderer import prefilter_voxel, scaffold_gs_render
 from torch import Tensor
 from torch.nn import Parameter

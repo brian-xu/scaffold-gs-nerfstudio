@@ -19,6 +19,7 @@ import torch
 from nerfstudio.cameras.cameras import Cameras as NerfstudioCamera
 
 
+## From RaDe-GS: https://github.com/BaowenZ/RaDe-GS
 # the following functions depths_double_to_points and depth_double_to_normal are adopted from https://github.com/hugoycj/2dgs-gaustudio/blob/main/utils/graphics_utils.py
 def depths_double_to_points(camera: NerfstudioCamera, depthmap1, depthmap2):
     colmap_camera: ColmapCamera = convert_to_colmap_camera(camera)
@@ -55,7 +56,7 @@ def depths_double_to_points(camera: NerfstudioCamera, depthmap1, depthmap2):
     return points1.reshape(3, H, W), points2.reshape(3, H, W)
 
 
-def point_double_to_normal(camera: NerfstudioCamera, points1, points2):
+def point_double_to_normal(points1, points2):
     points = torch.stack([points1, points2], dim=0)
     output = torch.zeros_like(points)
     dx = points[..., 2:, 1:-1] - points[..., :-2, 1:-1]
@@ -67,7 +68,7 @@ def point_double_to_normal(camera: NerfstudioCamera, points1, points2):
 
 def depth_double_to_normal(camera: NerfstudioCamera, depth1, depth2):
     points1, points2 = depths_double_to_points(camera, depth1, depth2)
-    return point_double_to_normal(camera, points1, points2)
+    return point_double_to_normal(points1, points2)
 
 
 class ColmapCamera:

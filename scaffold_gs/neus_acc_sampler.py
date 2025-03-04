@@ -21,7 +21,6 @@ class NeuSAccSampler(Sampler):
         num_samples_boundary: int = 10,
         steps_warpup: int = 1000,
         steps_per_grid_update: int = 1000,
-        importance_sampling: bool = False,
         local_rank: int = 0,
         single_jitter: bool = False,
     ) -> None:
@@ -33,7 +32,6 @@ class NeuSAccSampler(Sampler):
         self.num_samples_importance = num_samples_importance
         self.num_samples_boundary = num_samples_boundary
         self.single_jitter = single_jitter
-        self.importance_sampling = importance_sampling
         self.steps_warpup = steps_warpup
         self.steps_per_grid_update = steps_per_grid_update
         self.local_rank = local_rank
@@ -202,6 +200,7 @@ class NeuSAccSampler(Sampler):
             ray_bundle, ray_indices, t_starts.unsqueeze(1), t_ends.unsqueeze(1)
         )
 
+        ## Support for ray_resampling seems to have been removed in nerfacc 0.5+
         # if self.importance_sampling and ray_samples.shape[0] > 0:
         #     # save_points("first.ply", ray_samples.frustums.get_start_positions().cpu().numpy().reshape(-1, 3))
 
