@@ -16,7 +16,6 @@ from nerfstudio.engine.optimizers import AdamOptimizerConfig
 from nerfstudio.engine.schedulers import (
     CosineDecaySchedulerConfig,
     ExponentialDecaySchedulerConfig,
-    MultiStepSchedulerConfig,
 )
 from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.fields.sdf_field import SDFFieldConfig
@@ -147,16 +146,10 @@ gsdf = MethodSpecification(
             ),
         ),
         optimizers={
-            "proposal_networks": {
-                "optimizer": AdamOptimizerConfig(lr=3e-2, eps=1e-15),
-                "scheduler": MultiStepSchedulerConfig(
-                    max_steps=45001, milestones=(15_000, 25000, 16500, 33000)
-                ),
-            },
             "fields": {
                 "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
                 "scheduler": DelayedCosineDecaySchedulerConfig(
-                    pretrain_steps=15_000,
+                    pretrain_steps=20_000,
                     warm_up_end=500,
                     learning_rate_alpha=0.05,
                     max_steps=45000,
@@ -165,7 +158,7 @@ gsdf = MethodSpecification(
             "field_background": {
                 "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
                 "scheduler": DelayedCosineDecaySchedulerConfig(
-                    pretrain_steps=15_000,
+                    pretrain_steps=20_000,
                     warm_up_end=500,
                     learning_rate_alpha=0.05,
                     max_steps=45000,

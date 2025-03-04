@@ -8,6 +8,7 @@ from einops import rearrange
 from jaxtyping import Shaped
 from pytorch_msssim import SSIM
 from scaffold_gs.gaussian_splatting.cameras import depth_double_to_normal
+from scaffold_gs.neus_acc_model import NeuSAccModel, NeuSAccModelConfig
 from scaffold_gs.scaffold_gs_renderer import prefilter_voxel, scaffold_gs_render
 from torch import Tensor
 from torch.nn import Parameter
@@ -29,7 +30,6 @@ from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.mlp import MLP
 from nerfstudio.model_components.lib_bilagrid import color_correct
 from nerfstudio.model_components.losses import interlevel_loss, monosdf_normal_loss
-from nerfstudio.models.neus_facto import NeuSFactoModel, NeuSFactoModelConfig
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.math import k_nearest_sklearn
 
@@ -79,7 +79,7 @@ def resize_image(image: torch.Tensor, d: int):
 
 
 @dataclass
-class GSDFModelConfig(NeuSFactoModelConfig):
+class GSDFModelConfig(NeuSAccModelConfig):
     """GSDF Model Config"""
 
     _target: Type = field(default_factory=lambda: GSDFModel)
@@ -105,8 +105,11 @@ class GSDFModelConfig(NeuSFactoModelConfig):
     min_opacity: float = 0.005
     success_threshold: float = 0.8
     densify_grad_threshold: float = 0.0002
-    scaffold_gs_pretrain: int = 15_000
+    scaffold_gs_pretrain: int = 20_000
     normal_loss_warmup: int = 5000
+
+    regularization_from_iter = 15_000
+    lambda_depth_normal = 0.05
 
     resolution_schedule: int = 3000
     """training starts at 1/d resolution, every n steps this is doubled"""
@@ -130,7 +133,7 @@ class GSDFModelConfig(NeuSFactoModelConfig):
     """If True, apply color correction to the rendered images before computing the metrics."""
 
 
-class GSDFModel(NeuSFactoModel):
+class GSDFModel(NeuSAccModel):
     """Nerfstudio implementation of GSDF
 
     Args:
@@ -260,7 +263,7 @@ class GSDFModel(NeuSFactoModel):
 
         self.ray_collider, self.collider = self.collider, None
 
-        # self.depth_sampler = GSDFDepthSampler(radius=self.config.radius)
+        self.sampler.steps_warpup += self.config.scaffold_gs_pretrain
 
     @property
     def num_points(self):
@@ -416,36 +419,25 @@ class GSDFModel(NeuSFactoModel):
     ) -> List[TrainingCallback]:
         cbs = []
 
-        if self.config.use_proposal_weight_anneal:
-            # anneal the weights of the proposal network before doing PDF sampling
-            N = self.config.proposal_weights_anneal_max_num_iters
-
-            def set_anneal(step: int):
-                # https://arxiv.org/pdf/2111.12077.pdf eq. 18
-                train_frac = np.clip(
-                    (step - self.config.scaffold_gs_pretrain) / N, 0, 1
-                )
-
-                def bias(x, b):
-                    return b * x / ((b - 1) * x + 1)
-
-                anneal = bias(train_frac, self.config.proposal_weights_anneal_slope)
-                self.proposal_sampler.set_anneal(anneal)
-
-            cbs.append(
-                TrainingCallback(
-                    where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
-                    update_every_num_iters=1,
-                    func=set_anneal,
-                )
+        # add sampler call backs
+        sdf_fn = lambda x: self.field.forward_geonetwork(x)[:, 0].contiguous()
+        inv_s = self.field.deviation_network.get_variance
+        cbs.append(
+            TrainingCallback(
+                where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                update_every_num_iters=1,
+                func=self.sampler.update_step_size,
+                kwargs={"inv_s": inv_s},
             )
-            cbs.append(
-                TrainingCallback(
-                    where_to_run=[TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
-                    update_every_num_iters=1,
-                    func=self.proposal_sampler.step_cb,
-                )
+        )
+        cbs.append(
+            TrainingCallback(
+                where_to_run=[TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+                update_every_num_iters=1,
+                func=self.sampler.update_binary_grid,
+                kwargs={"sdf_fn": sdf_fn, "inv_s": inv_s},
             )
+        )
 
         if self.anneal_end > 0:
 
@@ -482,38 +474,6 @@ class GSDFModel(NeuSFactoModel):
             )
         )
         return cbs
-
-    # def sample_and_forward_field(
-    #     self,
-    #     ray_bundle: RayBundle,
-    #     metric_depth: Optional[Float[Tensor, "*batch num_samples 1"]] = None,
-    # ) -> Dict[str, Any]:
-    #     """Sample rays using GS depth and compute the corresponding field outputs."""
-    #     if metric_depth is None:
-    #         return super().sample_and_forward_field(ray_bundle)
-    #     metric_depth = metric_depth.unsqueeze(-1).detach()
-    #     metric_depth_positions = (
-    #         ray_bundle.origins + ray_bundle.directions * metric_depth
-    #     )
-    #     # Calculate the sdf values in the depth points
-    #     sdf_depth = self.field.get_sdf(rays_from_positions(metric_depth_positions))
-    #     ray_samples = self.depth_sampler.generate_ray_samples(
-    #         ray_bundle, gs_depth=metric_depth, sdf_depth=sdf_depth
-    #     )
-
-    #     field_outputs = self.field(ray_samples, return_alphas=True)
-    #     weights, transmittance = ray_samples.get_weights_and_transmittance_from_alphas(
-    #         field_outputs[FieldHeadNames.ALPHA]
-    #     )
-    #     bg_transmittance = transmittance[:, -1, :]
-
-    #     samples_and_field_outputs = {
-    #         "ray_samples": ray_samples,
-    #         "field_outputs": field_outputs,
-    #         "weights": weights,
-    #         "bg_transmittance": bg_transmittance,
-    #     }
-    #     return samples_and_field_outputs
 
     def step_cb(self, optimizers: Optimizers, step):
         self.step = step
@@ -651,7 +611,6 @@ class GSDFModel(NeuSFactoModel):
             visible_mask=voxel_visible_mask,
             retain_grad=retain_grad,
         )
-        camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
 
         (
             render,
@@ -680,6 +639,11 @@ class GSDFModel(NeuSFactoModel):
         depth_middepth_normal = depth_double_to_normal(
             camera, rendered_expected_depth, rendered_median_depth
         )
+        normal_error_map = 1 - (gs_normal.unsqueeze(0) * depth_middepth_normal).sum(
+            dim=1
+        )
+
+        camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
 
         self.viewspace_point_tensor = viewspace_point_tensor
         self.neural_opacity = opacity
@@ -703,7 +667,8 @@ class GSDFModel(NeuSFactoModel):
             "normal": normal.squeeze(0),  # type: ignore
             "accumulation": accumulation.unsqueeze(-1),  # type: ignore
             "background": background,  # type: ignore
-            "scaling": scaling,
+            "scaling": scaling,  # type: ignore
+            "normal_error_map": normal_error_map.squeeze(0),  # type: ignore
         }  # type: ignore
 
         if self.step > self.config.scaffold_gs_pretrain and isinstance(
@@ -718,68 +683,19 @@ class GSDFModel(NeuSFactoModel):
             gs_depth = depth[ray_y_indices, ray_x_indices]
             gs_normal = normal[ray_y_indices, ray_x_indices]
 
-            samples_and_field_outputs = self.sample_and_forward_field(
-                ray_bundle=ray_bundle  # , metric_depth=gs_depth
-            )
-            field_outputs: Dict[FieldHeadNames, torch.Tensor] = cast(
-                Dict[FieldHeadNames, torch.Tensor],
-                samples_and_field_outputs["field_outputs"],
-            )
-            grad_points = field_outputs[FieldHeadNames.GRADIENT]
-            ray_samples = samples_and_field_outputs["ray_samples"]
-            weights = samples_and_field_outputs["weights"]
-            bg_transmittance = samples_and_field_outputs["bg_transmittance"]
-
-            neus_rgb = self.renderer_rgb(
-                rgb=field_outputs[FieldHeadNames.RGB], weights=weights
-            )
-            neus_depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
-            # the rendered depth is point-to-point distance and we should convert to depth
-            neus_depth = neus_depth / ray_bundle.metadata["directions_norm"]
-            neus_normal = self.renderer_normal(
-                semantics=field_outputs[FieldHeadNames.NORMALS], weights=weights
-            )
-            neus_accumulation = self.renderer_accumulation(weights=weights)
-            # background model
-            if self.config.background_model != "none":
-                assert isinstance(
-                    self.field_background, torch.nn.Module
-                ), "field_background should be a module"
-                assert ray_bundle.fars is not None, "fars is required in ray_bundle"
-                # sample inversely from far to 1000 and points and forward the bg model
-                ray_bundle.nears = ray_bundle.fars
-                assert ray_bundle.fars is not None
-                ray_bundle.fars = (
-                    torch.ones_like(ray_bundle.fars) * self.config.far_plane_bg
-                )
-
-                ray_samples_bg = self.sampler_bg(ray_bundle)
-                # use the same background model for both density field and occupancy field
-                assert not isinstance(self.field_background, Parameter)
-                field_outputs_bg = self.field_background(ray_samples_bg)
-                weights_bg = ray_samples_bg.get_weights(
-                    field_outputs_bg[FieldHeadNames.DENSITY]
-                )
-
-                rgb_bg = self.renderer_rgb(
-                    rgb=field_outputs_bg[FieldHeadNames.RGB], weights=weights_bg
-                )
-
-                # merge background color to foregound color
-                neus_rgb = neus_rgb + bg_transmittance * rgb_bg
-
-            return_dict["neus_info"] = (
-                neus_rgb,
-                neus_depth,
-                gs_depth,
-                neus_normal,
-                gs_normal,
-                neus_accumulation,
-            )
+            neus_outputs = super().get_outputs(ray_bundle)
 
             if self.training:
-                return_dict.update({"eik_grad": grad_points})
-                return_dict.update(samples_and_field_outputs)
+                return_dict.update({"eik_grad": neus_outputs["eik_grad"]})
+
+            return_dict["neus_info"] = (
+                neus_outputs["rgb"],
+                neus_outputs["depth"],
+                gs_depth,
+                neus_outputs["normal"],
+                gs_normal,
+                neus_outputs["accumulation"],
+            )
 
         return return_dict
 
@@ -871,6 +787,14 @@ class GSDFModel(NeuSFactoModel):
             + self.config.ssim_lambda * simloss,
         }
 
+        if self.step > self.config.regularization_from_iter:
+            depth_ratio = 0.6
+
+            loss_dict["depth_normal_loss"] = (
+                (1 - depth_ratio) * outputs["normal_error_map"][0].mean()
+                + depth_ratio * outputs["normal_error_map"][1].mean()
+            ) * self.config.lambda_depth_normal
+
         if self.step > self.config.scaffold_gs_pretrain and self.training:
             scaling_reg = outputs["scaling"].prod(dim=1).mean()
             loss_dict["main_loss"] += 0.01 * scaling_reg
@@ -928,10 +852,6 @@ class GSDFModel(NeuSFactoModel):
             loss_dict["eikonal_loss"] = (
                 (grad_theta.norm(2, dim=-1) - 1) ** 2
             ).mean() * self.config.eikonal_loss_mult
-            loss_dict["interlevel_loss"] = (
-                self.config.interlevel_loss_mult
-                * interlevel_loss(outputs["weights_list"], outputs["ray_samples_list"])
-            )
 
             if self.step > self.config.scaffold_gs_pretrain + self.config.warmup_length:
                 loss_dict["gsdf_loss"] = (

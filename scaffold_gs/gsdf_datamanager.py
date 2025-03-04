@@ -29,7 +29,7 @@ class GSDFDataManagerConfig(VanillaDataManagerConfig):
     """Number of images to sample during eval iteration."""
     eval_num_times_to_repeat_images: int = 1
     """How many steps to pretrain the Scaffold-GS model before dual training."""
-    scaffold_gs_pretrain: int = 15_000
+    scaffold_gs_pretrain: int = 20_000
 
 
 class GSDFDataManager(VanillaDataManager):
