@@ -19,11 +19,12 @@ Implementation of VolSDF.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Type
+from typing import List, Type
 
 import nerfacc
 import torch
 from scaffold_gs.neus_acc_sampler import NeuSAccSampler
+from torch.nn import Parameter
 
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.engine.callbacks import (
@@ -134,7 +135,64 @@ class NeuSAccModel(NeuSModel):
             # the rendered depth is point-to-point distance and we should convert to depth
             depth = depth / ray_bundle.metadata["directions_norm"]
 
-            # TODO: add background model
+            # background model
+            if self.config.background_model != "none":
+                assert isinstance(
+                    self.field_background, torch.nn.Module
+                ), "field_background should be a module"
+                assert ray_bundle.fars is not None, "fars is required in ray_bundle"
+                # sample inversely from far to 1000 and points and forward the bg model
+                ray_bundle.nears = ray_bundle.fars
+                assert ray_bundle.fars is not None
+                ray_bundle.fars = (
+                    torch.ones_like(ray_bundle.fars) * self.config.far_plane_bg
+                )
+
+                ray_samples_bg = self.sampler_bg(ray_bundle)
+                # use the same background model for both density field and occupancy field
+                assert not isinstance(self.field_background, Parameter)
+                field_outputs_bg = self.field_background(ray_samples_bg)
+                weights_bg = ray_samples_bg.get_weights(
+                    field_outputs_bg[FieldHeadNames.DENSITY]
+                )
+
+                rgb_bg = self.renderer_rgb(
+                    rgb=field_outputs_bg[FieldHeadNames.RGB], weights=weights_bg
+                )
+                depth_bg = self.renderer_depth(
+                    weights=weights_bg, ray_samples=ray_samples_bg
+                )
+                accumulation_bg = self.renderer_accumulation(weights=weights_bg)
+
+                bg_transmittance = torch.ones(
+                    [
+                        n_rays,
+                    ],
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+
+                bg_transmittance.index_reduce_(
+                    0,
+                    index=ray_indices,
+                    source=(1 - field_outputs[FieldHeadNames.ALPHA].flatten()),
+                    reduce="prod",
+                    include_self=False,
+                )
+
+                bg_transmittance = bg_transmittance.unsqueeze(-1).repeat(1, 3)
+
+                # merge background color to foregound color
+                rgb = rgb + bg_transmittance * rgb_bg
+
+                bg_outputs = {
+                    "bg_rgb": rgb_bg,
+                    "bg_accumulation": accumulation_bg,
+                    "bg_depth": depth_bg,
+                    "bg_weights": weights_bg,
+                }
+            else:
+                bg_outputs = {}
 
             outputs = {
                 "rgb": rgb,
@@ -142,6 +200,7 @@ class NeuSAccModel(NeuSModel):
                 "depth": depth,
                 "normal": normal,
             }
+            outputs.update(bg_outputs)
 
             if self.training:
                 grad_points = field_outputs[FieldHeadNames.GRADIENT]

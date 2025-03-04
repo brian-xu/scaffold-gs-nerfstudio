@@ -7,11 +7,16 @@ from scaffold_gs.neus_acc_model import NeuSAccModelConfig
 from scaffold_gs.scaffold_gs_model import ScaffoldGSModelConfig
 
 from nerfstudio.configs.base_config import ViewerConfig
-from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManagerConfig
+from nerfstudio.data.datamanagers.base_datamanager import (
+    VanillaDataManager,
+    VanillaDataManagerConfig,
+)
 from nerfstudio.data.datamanagers.full_images_datamanager import (
     FullImageDatamanagerConfig,
 )
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
+from nerfstudio.data.dataparsers.sdfstudio_dataparser import SDFStudioDataParserConfig
+from nerfstudio.data.datasets.sdf_dataset import SDFDataset
 from nerfstudio.engine.optimizers import AdamOptimizerConfig
 from nerfstudio.engine.schedulers import (
     CosineDecaySchedulerConfig,
@@ -256,11 +261,10 @@ neus_acc = MethodSpecification(
         mixed_precision=False,
         pipeline=VanillaPipelineConfig(
             datamanager=VanillaDataManagerConfig(
-                dataparser=NerfstudioDataParserConfig(
-                    load_3D_points=True, center_method="focus"
-                ),
+                _target=VanillaDataManager[SDFDataset],
+                dataparser=SDFStudioDataParserConfig(),
                 train_num_rays_per_batch=2048,
-                eval_num_rays_per_batch=1024,
+                eval_num_rays_per_batch=2048,
             ),
             model=NeuSAccModelConfig(eval_num_rays_per_chunk=1024),
         ),

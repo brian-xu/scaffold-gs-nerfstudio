@@ -19,7 +19,7 @@ class NeuSAccSampler(Sampler):
         num_samples: int = 8,
         num_samples_importance: int = 16,
         num_samples_boundary: int = 10,
-        steps_warpup: int = 1000,
+        steps_warpup: int = 100,
         steps_per_grid_update: int = 1000,
         local_rank: int = 0,
         single_jitter: bool = False,
