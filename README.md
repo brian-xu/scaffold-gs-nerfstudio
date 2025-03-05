@@ -3,10 +3,15 @@ Unofficial implementation of [Scaffold-GS](https://github.com/city-super/Scaffol
 
 https://github.com/user-attachments/assets/f7194455-e4a0-4c60-9608-837ef635f22b
 
+Additionally, we utilize depth+normal optimization from [RaDe-GS](https://github.com/BaowenZ/RaDe-GS) for improved reconstruction accuracy.
+
 ## GSDF: 3DGS Meets SDF for Improved Neural Rendering and Reconstruction
 Now includes an implementation of [GSDF](https://github.com/city-super/GSDF) as a [nerfstudio](https://github.com/nerfstudio-project/nerfstudio) extension.
 
 #### Note: there are several differences when compared to the reference implementation, as we build off of the nerfstudio implementation of NeuS.
+
+## Neus-Acc: NeuS with empty space skipping based on nerfacc
+Now includes a port of NeuS-Acc from [SDFStudio](https://github.com/autonomousvision/sdfstudio), ported for recent versions of nerfstudio and gsplat. Used in the implementation of GSDF to considerably speed up training.
 
 ## Status
 
@@ -14,12 +19,14 @@ Now includes an implementation of [GSDF](https://github.com/city-super/GSDF) as 
   - [x] Correctly rendering and training
   - [x] Anchor adjustment
   - [x] GSDF implementation
+  - [x] NeuS-Acc port
   - [ ] Debugging
 - [ ] Visualization
   - [x] Fix viser functionality
   - [ ] ...
 - [ ] Extras
   - [ ] Scaffold-GS baked splat export
+  - [ ] Scaffold-GS mesh export?
   - [ ] GSDF mesh export
   - [ ] ...
 
@@ -39,7 +46,7 @@ torchvision 0.16.2+cu118
 ```
 
 ## Registering with Nerfstudio
-Ensure that nerfstudio has been installed according to the [instructions](https://docs.nerf.studio/en/latest/quickstart/installation.html). Clone or fork this repository and run the commands:
+Ensure that nerfstudio has been installed according to the [instructions](https://docs.nerf.studio/quickstart/installation.html). Clone or fork this repository and run the commands:
 
 ```
 conda activate nerfstudio
@@ -66,6 +73,12 @@ ns-train gsdf --data [PATH] --pipeline.model.sdf-field.inside-outside False
 
 Unbounded scenes are not supported, but might work with `--pipeline.model.sdf-field.inside-outside True`.
 
+NeuS-Acc can be run via the following command:
+```
+ns-train neus-acc --data [PATH]
+```
+
+
 ## Acknowledgements
 
 Thanks to the authors of [Scaffold-GS](https://github.com/city-super/Scaffold-GS) for the reference implementation, which we build upon heavily.
@@ -75,5 +88,7 @@ Thanks to the authors of [GSDF](https://github.com/city-super/GSDF) for the refe
 Thanks to the authors of [SDFStudio](https://github.com/autonomousvision/sdfstudio) for their implementation of NeuS-acc.
 
 Thanks to the authors of [Splatfacto-360](https://github.com/myuito3/splatfacto-360) for their code converting nerfstudio cameras to the COLMAP format.
+
+Thanks to the authors of [RaDe-GS](https://github.com/BaowenZ/RaDe-GS) for their differentiable depth + normal rasterization code.
 
 Thanks to the authors of [dn-splatter](https://github.com/maturk/dn-splatter) for providing examples of how to export splats from a nerfstudio extension.
