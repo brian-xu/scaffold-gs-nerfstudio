@@ -88,6 +88,7 @@ class NeuSAccSampler(Sampler):
         self.register_buffer("cube_coordinate", cube_coordinate)
 
     def update_step_size(self, step, inv_s=None):
+        # TODO: causes OOM when too small, figure out a good bound
         assert inv_s is not None
         inv_s = inv_s().item()
         self.step_size = 14.0 / inv_s / 16

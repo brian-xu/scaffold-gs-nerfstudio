@@ -8,7 +8,6 @@ from einops import rearrange
 from jaxtyping import Shaped
 from pytorch_msssim import SSIM
 from scaffold_gs.gaussian_splatting.cameras import depth_double_to_normal
-from scaffold_gs.neus_acc_model import NeuSAccModel, NeuSAccModelConfig
 from scaffold_gs.scaffold_gs_renderer import prefilter_voxel, scaffold_gs_render
 from torch import Tensor
 from torch.nn import Parameter
@@ -30,6 +29,7 @@ from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.mlp import MLP
 from nerfstudio.model_components.lib_bilagrid import color_correct
 from nerfstudio.model_components.losses import interlevel_loss, monosdf_normal_loss
+from nerfstudio.models.neus_facto import NeuSFactoModel, NeuSFactoModelConfig
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.math import k_nearest_sklearn
 
@@ -79,7 +79,7 @@ def resize_image(image: torch.Tensor, d: int):
 
 
 @dataclass
-class GSDFModelConfig(NeuSAccModelConfig):
+class GSDFModelConfig(NeuSFactoModelConfig):
     """GSDF Model Config"""
 
     _target: Type = field(default_factory=lambda: GSDFModel)
@@ -133,7 +133,7 @@ class GSDFModelConfig(NeuSAccModelConfig):
     """If True, apply color correction to the rendered images before computing the metrics."""
 
 
-class GSDFModel(NeuSAccModel):
+class GSDFModel(NeuSFactoModel):
     """Nerfstudio implementation of GSDF
 
     Args:
@@ -262,8 +262,6 @@ class GSDFModel(NeuSAccModel):
             self.background_color = get_color(self.config.background_color)
 
         self.ray_collider, self.collider = self.collider, None
-
-        self.sampler.steps_warpup += self.config.scaffold_gs_pretrain
 
     @property
     def num_points(self):
@@ -419,26 +417,36 @@ class GSDFModel(NeuSAccModel):
     ) -> List[TrainingCallback]:
         cbs = []
 
-        # add sampler call backs
-        sdf_fn = lambda x: self.field.forward_geonetwork(x)[:, 0].contiguous()
-        inv_s = self.field.deviation_network.get_variance
-        cbs.append(
-            TrainingCallback(
-                where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
-                update_every_num_iters=1,
-                func=self.sampler.update_step_size,
-                kwargs={"inv_s": inv_s},
-            )
-        )
-        cbs.append(
-            TrainingCallback(
-                where_to_run=[TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
-                update_every_num_iters=1,
-                func=self.sampler.update_binary_grid,
-                kwargs={"sdf_fn": sdf_fn, "inv_s": inv_s},
-            )
-        )
+        if self.config.use_proposal_weight_anneal:
+            # anneal the weights of the proposal network before doing PDF sampling
+            N = self.config.proposal_weights_anneal_max_num_iters
 
+            def set_anneal(step: int):
+                # https://arxiv.org/pdf/2111.12077.pdf eq. 18
+                train_frac = np.clip(
+                    (step - self.config.scaffold_gs_pretrain) / N, 0, 1
+                )
+
+                def bias(x, b):
+                    return b * x / ((b - 1) * x + 1)
+
+                anneal = bias(train_frac, self.config.proposal_weights_anneal_slope)
+                self.proposal_sampler.set_anneal(anneal)
+
+            cbs.append(
+                TrainingCallback(
+                    where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                    update_every_num_iters=1,
+                    func=set_anneal,
+                )
+            )
+            cbs.append(
+                TrainingCallback(
+                    where_to_run=[TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+                    update_every_num_iters=1,
+                    func=self.proposal_sampler.step_cb,
+                )
+            )
         if self.anneal_end > 0:
 
             def set_anneal(step):
