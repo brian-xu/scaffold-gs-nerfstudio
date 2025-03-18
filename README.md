@@ -3,7 +3,10 @@ Unofficial implementation of [Scaffold-GS](https://github.com/city-super/Scaffol
 
 https://github.com/user-attachments/assets/f7194455-e4a0-4c60-9608-837ef635f22b
 
-Additionally, we utilize depth+normal optimization from [RaDe-GS](https://github.com/BaowenZ/RaDe-GS) for improved reconstruction accuracy.
+Additionally, we include depth+normal optimization from [RaDe-GS](https://github.com/BaowenZ/RaDe-GS).
+
+https://github.com/user-attachments/assets/65e1e584-f0d8-441f-b432-9c28c4620b21
+
 
 ## GSDF: 3DGS Meets SDF for Improved Neural Rendering and Reconstruction
 Now includes an implementation of [GSDF](https://github.com/city-super/GSDF) as a [nerfstudio](https://github.com/nerfstudio-project/nerfstudio) extension.
