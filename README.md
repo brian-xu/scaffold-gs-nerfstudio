@@ -29,10 +29,10 @@ Now includes a port of NeuS-Acc from [SDFStudio](https://github.com/autonomousvi
   - [ ] ...
 - [ ] Extras
   - [x] GSDF implementation
-  - [ ] Scaffold-GS baked splat export
-  - [ ] Scaffold-GS mesh export?
+  - [ ] ~~Scaffold-GS baked splat export~~ not feasible
   - [ ] GSDF mesh export
   - [ ] NeuS-Acc port
+  - [ ] Scaffold-GS mesh export?
   - [ ] ...
 
 
