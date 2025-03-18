@@ -131,7 +131,7 @@ gsdf = MethodSpecification(
         method_name="gsdf",
         steps_per_eval_image=5000,
         steps_per_eval_batch=5000,
-        steps_per_save=500,
+        steps_per_save=2000,
         steps_per_eval_all_images=1000000,  # set to a very large model so we don't eval with all images
         max_num_iterations=45000,
         mixed_precision=False,
@@ -143,9 +143,13 @@ gsdf = MethodSpecification(
             ),
             model=GSDFModelConfig(
                 sdf_field=SDFFieldConfig(
+                    use_grid_feature=True,
                     num_layers=2,
+                    num_layers_color=2,
+                    hidden_dim=256,
                     bias=0.5,
-                    beta_init=0.3,
+                    beta_init=0.8,
+                    use_appearance_embedding=False,
                 ),
                 mono_depth_loss_mult=0.05,
                 mono_normal_loss_mult=0.01,
@@ -262,9 +266,9 @@ neus_acc = MethodSpecification(
         method_name="neus-acc",
         steps_per_eval_image=5000,
         steps_per_eval_batch=5000,
-        steps_per_save=20000,
+        steps_per_save=2000,
         steps_per_eval_all_images=1000000,  # set to a very large model so we don't eval with all images
-        max_num_iterations=20000,
+        max_num_iterations=20001,
         mixed_precision=False,
         pipeline=VanillaPipelineConfig(
             datamanager=VanillaDataManagerConfig(
@@ -279,13 +283,13 @@ neus_acc = MethodSpecification(
             "fields": {
                 "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
                 "scheduler": CosineDecaySchedulerConfig(
-                    warm_up_end=500, learning_rate_alpha=0.05, max_steps=20000
+                    warm_up_end=500, learning_rate_alpha=0.05, max_steps=20001
                 ),
             },
             "field_background": {
                 "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
                 "scheduler": CosineDecaySchedulerConfig(
-                    warm_up_end=500, learning_rate_alpha=0.05, max_steps=20000
+                    warm_up_end=500, learning_rate_alpha=0.05, max_steps=20001
                 ),
             },
         },
