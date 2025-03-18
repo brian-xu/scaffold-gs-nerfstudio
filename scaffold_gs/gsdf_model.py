@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from functools import reduce
-from typing import Dict, List, Literal, Optional, Tuple, Type, Union, cast
+from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
@@ -25,10 +25,9 @@ from nerfstudio.engine.callbacks import (
 )
 from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.field_components.embedding import Embedding
-from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.mlp import MLP
 from nerfstudio.model_components.lib_bilagrid import color_correct
-from nerfstudio.model_components.losses import interlevel_loss, monosdf_normal_loss
+from nerfstudio.model_components.losses import MiDaSMSELoss, monosdf_normal_loss
 from nerfstudio.models.neus_facto import NeuSFactoModel, NeuSFactoModelConfig
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.math import k_nearest_sklearn
@@ -262,6 +261,8 @@ class GSDFModel(NeuSFactoModel):
             self.background_color = get_color(self.config.background_color)
 
         self.ray_collider, self.collider = self.collider, None
+
+        self.depth_loss = MiDaSMSELoss()
 
     @property
     def num_points(self):
