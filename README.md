@@ -16,21 +16,23 @@ Now includes an implementation of [GSDF](https://github.com/city-super/GSDF) as 
 ## Neus-Acc: NeuS with empty space skipping based on nerfacc
 Now includes a port of NeuS-Acc from [SDFStudio](https://github.com/autonomousvision/sdfstudio), ported for recent versions of nerfstudio and gsplat. Used in the implementation of GSDF to considerably speed up training.
 
+#### Note: Neus-Acc implementation is currently experimental.
+
 ## Status
 
 - [ ] Functionality
   - [x] Correctly rendering and training
   - [x] Anchor adjustment
-  - [x] GSDF implementation
-  - [x] NeuS-Acc port
   - [ ] Debugging
 - [ ] Visualization
   - [x] Fix viser functionality
   - [ ] ...
 - [ ] Extras
+  - [x] GSDF implementation
   - [ ] Scaffold-GS baked splat export
   - [ ] Scaffold-GS mesh export?
   - [ ] GSDF mesh export
+  - [ ] NeuS-Acc port
   - [ ] ...
 
 

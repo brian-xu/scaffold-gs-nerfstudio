@@ -107,6 +107,9 @@ class ScaffoldGSModelConfig(ModelConfig):
     """Config of the camera optimizer to use"""
     color_corrected_metrics: bool = False
     """If True, apply color correction to the rendered images before computing the metrics."""
+
+    "Depth+normal regularization from RaDe-GS. Can decrease NVS quality, so disabled by default."
+    depth_normal_regularization = False
     regularization_from_iter = 15_000
     lambda_depth_normal = 0.05
 
@@ -609,7 +612,10 @@ class ScaffoldGSModel(Model):
             + self.config.ssim_lambda * simloss,
         }
 
-        if self.step > self.config.regularization_from_iter:
+        if (
+            self.config.depth_normal_regularization
+            and self.step > self.config.regularization_from_iter
+        ):
             depth_ratio = 0.6
 
             loss_dict["depth_normal_loss"] = (
