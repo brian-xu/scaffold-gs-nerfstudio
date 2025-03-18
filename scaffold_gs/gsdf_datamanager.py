@@ -21,7 +21,7 @@ class GSDFDataManagerConfig(VanillaDataManagerConfig):
     _target: Type = field(default_factory=lambda: GSDFDataManager)
     train_num_images_to_sample_from: int = 1
     """Number of images to sample during training iteration."""
-    train_num_times_to_repeat_images: int = 1
+    train_num_times_to_repeat_images: int = 0
     """When not training on all images, number of iterations before picking new
     images. If -1, never pick new images."""
     """Number of rays per batch to use per eval iteration."""
