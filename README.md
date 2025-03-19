@@ -9,7 +9,13 @@ https://github.com/user-attachments/assets/65e1e584-f0d8-441f-b432-9c28c4620b21
 
 
 ## GSDF: 3DGS Meets SDF for Improved Neural Rendering and Reconstruction
-Now includes an implementation of [GSDF](https://github.com/city-super/GSDF) as a [nerfstudio](https://github.com/nerfstudio-project/nerfstudio) extension.
+Now includes an implementation of [GSDF](https://github.com/city-super/GSDF).
+
+The below results are a work-in-progress and were trained without any hyperparameter fine-tuning (which NeuS is very sensitive to).
+
+| RGB  | Depth | Normal |
+| ------------- | ------------- | ------------- |
+| ![](https://github.com/user-attachments/assets/3b1a7cdc-f71a-4419-8847-8a67b2744eb0) | ![](https://github.com/user-attachments/assets/15ce7de3-d846-41d1-b081-6cb347c3a5e2) | ![](https://github.com/user-attachments/assets/9b50aabc-8b10-4674-833d-e00a2b0d2481) |
 
 #### Note: there are several differences when compared to the reference implementation, as we build off of the nerfstudio implementation of NeuS.
 
