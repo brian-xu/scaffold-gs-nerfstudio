@@ -100,5 +100,3 @@ Thanks to the authors of [SDFStudio](https://github.com/autonomousvision/sdfstud
 Thanks to the authors of [Splatfacto-360](https://github.com/myuito3/splatfacto-360) for their code converting nerfstudio cameras to the COLMAP format.
 
 Thanks to the authors of [RaDe-GS](https://github.com/BaowenZ/RaDe-GS) for their differentiable depth + normal rasterization code.
-
-Thanks to the authors of [dn-splatter](https://github.com/maturk/dn-splatter) for providing examples of how to export splats from a nerfstudio extension.
