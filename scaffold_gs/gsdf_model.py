@@ -1,3 +1,4 @@
+from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import reduce
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union
@@ -31,6 +32,7 @@ from nerfstudio.model_components.losses import MiDaSMSELoss, monosdf_normal_loss
 from nerfstudio.models.neus_facto import NeuSFactoModel, NeuSFactoModelConfig
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.math import k_nearest_sklearn
+from nerfstudio.viewer.viewer_elements import ViewerCheckbox
 
 
 def inverse_sigmoid(x):
@@ -148,6 +150,9 @@ class GSDFModel(NeuSFactoModel):
         **kwargs,
     ):
         self.seed_points = seed_points
+        self.neus_render = ViewerCheckbox(
+            name="Display NeuS Output", default_value=True
+        )
         super().__init__(*args, **kwargs)
 
     def populate_modules(self):
@@ -578,6 +583,41 @@ class GSDFModel(NeuSFactoModel):
         outs = self.get_outputs(camera)
         return outs  # type: ignore
 
+    @torch.no_grad()
+    def get_neus_outputs_for_viser(
+        self, camera_ray_bundle: RayBundle
+    ) -> Dict[str, torch.Tensor]:
+        """Takes in camera parameters and computes the output of the model.
+
+        Args:
+            camera_ray_bundle: ray bundle to calculate outputs over
+        """
+        input_device = camera_ray_bundle.directions.device
+        num_rays_per_chunk = self.config.eval_num_rays_per_chunk
+        image_height, image_width = camera_ray_bundle.origins.shape[:2]
+        num_rays = len(camera_ray_bundle)
+        outputs_lists = defaultdict(list)
+        for i in range(0, num_rays, num_rays_per_chunk):
+            start_idx = i
+            end_idx = i + num_rays_per_chunk
+            ray_bundle = camera_ray_bundle.get_row_major_sliced_ray_bundle(
+                start_idx, end_idx
+            )
+            # move the chunk inputs to the model device
+            ray_bundle = ray_bundle.to(self.device)
+            ray_bundle = self.ray_collider(ray_bundle)
+            outputs = super().get_outputs(ray_bundle)
+            for output_name, output in outputs.items():  # type: ignore
+                if not isinstance(output, torch.Tensor):
+                    # TODO: handle lists of tensors as well
+                    continue
+                # move the chunk outputs from the model device back to the device of the inputs.
+                outputs_lists[output_name].append(output.to(input_device))
+        outputs = {}
+        for output_name, outputs_list in outputs_lists.items():
+            outputs[output_name] = torch.cat(outputs_list).view(image_height, image_width, -1)  # type: ignore
+        return outputs
+
     def get_outputs(
         self, ray_bundle: RayBundle
     ) -> Dict[str, Union[torch.Tensor, List]]:
@@ -593,7 +633,9 @@ class GSDFModel(NeuSFactoModel):
         if isinstance(ray_bundle, RayBundle):
             ray_bundle = self.ray_collider(ray_bundle)
             if not hasattr(ray_bundle, "extra"):
-                return super().get_outputs(ray_bundle)
+                neus_outputs = super().get_outputs(ray_bundle)
+                neus_outputs["normals"] = neus_outputs["normal_vis"]
+                return neus_outputs
             camera = ray_bundle.extra["camera"]
         elif isinstance(ray_bundle, Cameras):
             camera = ray_bundle
@@ -680,30 +722,47 @@ class GSDFModel(NeuSFactoModel):
             "normal_error_map": normal_error_map.squeeze(0),  # type: ignore
         }  # type: ignore
 
-        if self.step > self.config.scaffold_gs_pretrain and isinstance(
-            ray_bundle, RayBundle
+        if self.step > self.config.scaffold_gs_pretrain and (
+            isinstance(ray_bundle, RayBundle) or self.neus_render.value
         ):
 
-            ray_x_indices = ray_bundle.extra["indices"][:, 2] // camera_scale_fac
-            ray_x_indices = torch.clamp(ray_x_indices, min=0, max=W - 1).int()
-            ray_y_indices = ray_bundle.extra["indices"][:, 1] // camera_scale_fac
-            ray_y_indices = torch.clamp(ray_y_indices, min=0, max=H - 1).int()
+            if not isinstance(ray_bundle, RayBundle):
+                ray_bundle = camera.generate_rays(
+                    camera_indices=0, keep_shape=True, obb_box=self.crop_box
+                )
+                neus_outputs = self.get_neus_outputs_for_viser(ray_bundle)
 
-            gs_depth = depth[ray_y_indices, ray_x_indices]
-            gs_normal = normal[ray_y_indices, ray_x_indices]
+            else:
+                neus_outputs = super().get_outputs(ray_bundle)
 
-            neus_outputs = super().get_outputs(ray_bundle)
+                ray_x_indices = ray_bundle.extra["indices"][:, 2] // camera_scale_fac
+                ray_x_indices = torch.clamp(ray_x_indices, min=0, max=W - 1).int()
+                ray_y_indices = ray_bundle.extra["indices"][:, 1] // camera_scale_fac
+                ray_y_indices = torch.clamp(ray_y_indices, min=0, max=H - 1).int()
+
+                gs_depth = depth[ray_y_indices, ray_x_indices]
+                gs_normal = normal[ray_y_indices, ray_x_indices]
+
+                return_dict["neus_info"] = (
+                    neus_outputs["rgb"],
+                    neus_outputs["depth"],
+                    gs_depth,
+                    neus_outputs["normal"],
+                    gs_normal,
+                    neus_outputs["accumulation"],
+                )
 
             if self.training:
                 return_dict.update({"eik_grad": neus_outputs["eik_grad"]})
 
-            return_dict["neus_info"] = (
-                neus_outputs["rgb"],
-                neus_outputs["depth"],
-                gs_depth,
-                neus_outputs["normal"],
-                gs_normal,
-                neus_outputs["accumulation"],
+            # display in viser
+            return_dict.update(
+                {
+                    "neus_rgb": neus_outputs["rgb"],
+                    "neus_depth": neus_outputs["depth"],
+                    "neus_normal": neus_outputs["normal_vis"],
+                    "neus_accumulation": neus_outputs["accumulation"],
+                }
             )
 
         return return_dict
@@ -739,6 +798,9 @@ class GSDFModel(NeuSFactoModel):
             outputs: the output to compute loss dict to
             batch: ground truth batch corresponding to outputs
         """
+        if self.step == 0:
+            return {}
+
         gt_rgb = self.composite_with_background(
             self.get_gt_img(batch["full_image"]), outputs["background"]
         )
@@ -771,6 +833,9 @@ class GSDFModel(NeuSFactoModel):
             batch: ground truth batch corresponding to outputs
             metrics_dict: dictionary of metrics, some of which we can use for loss
         """
+        if self.step == 0:
+            return {"main_loss": torch.tensor([0.0], requires_grad=True)}
+        
         gt_img = self.composite_with_background(
             self.get_gt_img(batch["full_image"]), outputs["background"]
         )

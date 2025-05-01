@@ -50,18 +50,20 @@ class GSDFDataManager(VanillaDataManager):
         camera = self.train_dataset.cameras[
             image_batch["image_idx"][0] : image_batch["image_idx"][0] + 1
         ]
-        if step == 0 or step > self.config.scaffold_gs_pretrain:
-            batch = self.train_pixel_sampler.sample(image_batch)
-            ray_indices = batch["indices"]
-            ray_bundle = self.train_ray_generator(ray_indices)
+        if 0 < step < self.config.scaffold_gs_pretrain:
+            image_batch["full_image"] = image_batch["image"][0]
+            return camera, image_batch
+        batch = self.train_pixel_sampler.sample(image_batch)
+        ray_indices = batch["indices"]
+        ray_bundle = self.train_ray_generator(ray_indices)
+        batch["full_image"] = image_batch["image"][0]
+        if step == 0:
+            return ray_bundle, batch
+        elif step > self.config.scaffold_gs_pretrain:
             ray_bundle.extra = {}
             ray_bundle.extra["camera"] = camera
             ray_bundle.extra["indices"] = ray_indices
-            batch["full_image"] = image_batch["image"][0]
             return ray_bundle, batch
-        else:
-            image_batch["full_image"] = image_batch["image"][0]
-            return camera, image_batch
 
     def next_eval(self, step: int) -> Tuple[RayBundle, Dict]:
         """Returns the next batch of data from the eval dataloader."""
@@ -72,15 +74,17 @@ class GSDFDataManager(VanillaDataManager):
         camera = self.eval_dataset.cameras[
             image_batch["image_idx"][0] : image_batch["image_idx"][0] + 1
         ]
-        if step == 0 or step > self.config.scaffold_gs_pretrain:
-            batch = self.eval_pixel_sampler.sample(image_batch)
-            ray_indices = batch["indices"]
-            ray_bundle = self.eval_ray_generator(ray_indices)
+        if 0 < step < self.config.scaffold_gs_pretrain:
+            image_batch["full_image"] = image_batch["image"][0]
+            return camera, image_batch
+        batch = self.eval_pixel_sampler.sample(image_batch)
+        ray_indices = batch["indices"]
+        ray_bundle = self.eval_ray_generator(ray_indices)
+        batch["full_image"] = image_batch["image"][0]
+        if step == 0:
+            return ray_bundle, batch
+        else:
             ray_bundle.extra = {}
             ray_bundle.extra["camera"] = camera
             ray_bundle.extra["indices"] = ray_indices
-            batch["full_image"] = image_batch["image"][0]
             return ray_bundle, batch
-        else:
-            image_batch["full_image"] = image_batch["image"][0]
-            return camera, image_batch

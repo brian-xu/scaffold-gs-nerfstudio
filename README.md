@@ -35,8 +35,8 @@ Now includes a port of NeuS-Acc from [SDFStudio](https://github.com/autonomousvi
   - [ ] ...
 - [ ] Extras
   - [x] GSDF implementation
-  - [ ] GSDF mesh export
-  - [ ] NeuS-Acc port
+  - [x] GSDF mesh export
+  - [~] NeuS-Acc port
   - [ ] Scaffold-GS mesh export
   - [ ] ...
 
