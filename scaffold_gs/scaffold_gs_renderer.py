@@ -11,12 +11,14 @@
 import math
 
 import torch
-from diff_scaffold_rasterization import (
-    GaussianRasterizationSettings,
-    GaussianRasterizer,
-)
 from einops import repeat
-from scaffold_gs.gaussian_splatting.cameras import convert_to_colmap_camera
+from scaffold_gs.gaussian_splatting.cameras import (
+    ColmapCamera,
+    convert_to_colmap_camera,
+)
+
+import gsplat
+from gsplat.cuda._wrapper import fully_fused_projection
 
 
 def generate_neural_gaussians(viewpoint_camera, pc, visible_mask=None):
@@ -158,73 +160,67 @@ def scaffold_gs_render(
         viewpoint_camera, pc, visible_mask
     )
 
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = (
-        torch.zeros_like(xyz, dtype=pc.anchor.dtype, requires_grad=True, device="cuda")
-        + 0
-    )
-    if retain_grad:
-        try:
-            screenspace_points.retain_grad()
-        except:
-            pass
-
     colmap_camera = convert_to_colmap_camera(viewpoint_camera)
 
     # Set up rasterization configuration
     tanfovx = math.tan(colmap_camera.FoVx * 0.5)
     tanfovy = math.tan(colmap_camera.FoVy * 0.5)
 
-    raster_settings = GaussianRasterizationSettings(
-        image_height=int(colmap_camera.image_height),
-        image_width=int(colmap_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        kernel_size=kernel_size,
-        bg=bg_color,
-        scale_modifier=scaling_modifier,
-        viewmatrix=colmap_camera.world_view_transform,
-        projmatrix=colmap_camera.full_proj_transform,
-        sh_degree=1,
-        campos=colmap_camera.camera_center,
-        prefiltered=False,
-        require_coord=require_coord,
-        require_depth=require_depth,
-        debug=False,
+    focal_length_x = colmap_camera.image_width / (2 * tanfovx)
+    focal_length_y = colmap_camera.image_height / (2 * tanfovy)
+    K = torch.tensor(
+        [
+            [focal_length_x, 0, colmap_camera.image_width / 2.0],
+            [0, focal_length_y, colmap_camera.image_height / 2.0],
+            [0, 0, 1],
+        ],
+        device="cuda",
     )
 
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-
-    # Rasterize visible Gaussians to image, obtain their radii (on screen).
+    viewmat = colmap_camera.world_view_transform.transpose(0, 1)  # [4, 4]
     (
-        rendered_image,
-        radii,
-        rendered_expected_coord,
-        rendered_median_coord,
-        rendered_expected_depth,
-        rendered_median_depth,
-        rendered_alpha,
-        rendered_normal,
-    ) = rasterizer(
-        means3D=xyz,
-        means2D=screenspace_points,
-        shs=None,
-        colors_precomp=color,
-        opacities=opacity,
-        scales=scaling,
-        rotations=rot,
-        cov3D_precomp=None,
+        render_colors,
+        render_alphas,
+        expected_depths,
+        median_depths,
+        expected_normals,
+        info,
+    ) = gsplat.rasterization(
+        means=xyz,  # [N, 3]
+        quats=rot,  # [N, 4]
+        scales=scaling,  # [N, 3]
+        opacities=opacity.squeeze(-1),  # [N,]
+        colors=color,
+        viewmats=viewmat[None],  # [1, 4, 4]
+        Ks=K[None],  # [1, 3, 3]
+        backgrounds=bg_color[None],
+        width=int(colmap_camera.image_width),
+        height=int(colmap_camera.image_height),
+        packed=False,
+        sh_degree=None,
+        render_mode="RGB",
+        return_depth_normal=True,
     )
+    
+    rendered_image = render_colors[0].permute(2, 0, 1)
+    rendered_alpha = render_alphas[0].permute(2, 0, 1)
+    rendered_expected_depth = expected_depths[0].permute(2, 0, 1)
+    rendered_median_depth = median_depths[0].permute(2, 0, 1)
+    rendered_normal = expected_normals[0].permute(2, 0, 1)
+    
+    radii = info["radii"].squeeze(0)  # [N,]
+    try:
+        info["means2d"].retain_grad()  # [1, N, 2]
+    except:
+        pass
 
     return {
         "render": rendered_image,
         "mask": rendered_alpha,
-        "expected_coord": rendered_expected_coord,
-        "median_coord": rendered_median_coord,
         "expected_depth": rendered_expected_depth,
         "median_depth": rendered_median_depth,
-        "viewspace_points": screenspace_points,
-        "visibility_filter": radii > 0,
+        "viewspace_points": info["means2d"],
+        "visibility_filter": torch.sum(radii, dim=-1).squeeze() > 0,
         "radii": radii,
         "selection_mask": mask,
         "neural_opacity": neural_opacity,
@@ -233,14 +229,7 @@ def scaffold_gs_render(
     }
 
 
-def prefilter_voxel(
-    viewpoint_camera,
-    pc,
-    bg_color: torch.Tensor,
-    kernel_size=0.0,
-    scaling_modifier=1.0,
-    override_color=None,
-):
+def prefilter_voxel(viewpoint_camera: ColmapCamera, pc):
     """
     Render the scene.
 
@@ -249,44 +238,57 @@ def prefilter_voxel(
 
     colmap_camera = convert_to_colmap_camera(viewpoint_camera)
 
+    means = pc.anchor
+    scales = pc.scaling[:, :3]
+    quats = pc.rotation
     # Set up rasterization configuration
     tanfovx = math.tan(colmap_camera.FoVx * 0.5)
     tanfovy = math.tan(colmap_camera.FoVy * 0.5)
+    focal_length_x = colmap_camera.image_width / (2 * tanfovx)
+    focal_length_y = colmap_camera.image_height / (2 * tanfovy)
 
-    raster_settings = GaussianRasterizationSettings(
-        image_height=int(colmap_camera.image_height),
-        image_width=int(colmap_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        kernel_size=kernel_size,
-        bg=bg_color,
-        scale_modifier=scaling_modifier,
-        viewmatrix=colmap_camera.world_view_transform,
-        projmatrix=colmap_camera.full_proj_transform,
-        sh_degree=1,
-        campos=colmap_camera.camera_center,
-        prefiltered=False,
-        debug=False,
-        require_depth=True,
-        require_coord=True,
+    Ks = torch.tensor(
+        [
+            [focal_length_x, 0, colmap_camera.image_width / 2.0],
+            [0, focal_length_y, colmap_camera.image_height / 2.0],
+            [0, 0, 1],
+        ],
+        device="cuda",
+    )[None]
+    viewmats = colmap_camera.world_view_transform.transpose(0, 1)[None]
+
+    N = means.shape[0]
+    C = viewmats.shape[0]
+    device = means.device
+    assert means.shape == (N, 3), means.shape
+    assert quats.shape == (N, 4), quats.shape
+    assert scales.shape == (N, 3), scales.shape
+    assert viewmats.shape == (C, 4, 4), viewmats.shape
+    assert Ks.shape == (C, 3, 3), Ks.shape
+
+    # Project Gaussians to 2D. Directly pass in {quats, scales} is faster than precomputing covars.
+    proj_results = fully_fused_projection(
+        means,
+        None,  # covars,
+        quats,
+        scales,
+        viewmats,
+        Ks,
+        int(colmap_camera.image_width),
+        int(colmap_camera.image_height),
+        eps2d=0.3,
+        packed=False,
+        near_plane=0.01,
+        far_plane=1e10,
+        radius_clip=0.0,
+        sparse_grad=False,
+        calc_compensations=False,
     )
 
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-
-    means3D = pc.anchor
-
-    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
-    # scaling / rotation by the rasterizer.
-    scales = None
-    rotations = None
-    cov3D_precomp = None
-    scales = pc.scaling
-    rotations = pc.rotation
-
-    radii_pure = rasterizer.visible_filter(
-        means3D=means3D,
-        scales=scales[:, :3],
-        rotations=rotations,
-        cov3D_precomp=cov3D_precomp,
+    # The results are with shape [C, N, ...]. Only the elements with radii > 0 are valid.
+    radii, means2d, depths, conics, compensations, ray_ts, ray_planes, normals = (
+        proj_results
     )
-    return radii_pure > 0
+    camera_ids, gaussian_ids = None, None
+
+    return torch.sum(radii, dim=-1).squeeze() > 0

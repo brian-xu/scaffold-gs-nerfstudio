@@ -463,7 +463,7 @@ class ScaffoldGSModel(Model):
         W, H = int(camera.width.item()), int(camera.height.item())
         self.last_size = (H, W)
         background = self._get_background_color()
-        voxel_visible_mask = prefilter_voxel(camera, self, background)
+        voxel_visible_mask = prefilter_voxel(camera, self)
         retain_grad = self.step < self.config.update_until and self.step >= 0
         render_pkg = scaffold_gs_render(
             camera,
@@ -722,7 +722,7 @@ class ScaffoldGSModel(Model):
         combined_mask[temp_mask] = self.visibility_filter
 
         grad_norm = torch.norm(
-            self.viewspace_point_tensor.grad[self.visibility_filter, :2],
+            self.viewspace_point_tensor.grad[0, self.visibility_filter, :2],
             dim=-1,
             keepdim=True,
         )
