@@ -59,7 +59,7 @@ class GSDFDataManager(VanillaDataManager):
         batch["full_image"] = image_batch["image"][0]
         if step == 0:
             return ray_bundle, batch
-        elif step > self.config.scaffold_gs_pretrain:
+        else:
             ray_bundle.extra = {}
             ray_bundle.extra["camera"] = camera
             ray_bundle.extra["indices"] = ray_indices
